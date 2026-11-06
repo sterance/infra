@@ -24,20 +24,34 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { id-token: write }
     outputs:
-      mode:     ${{ steps.bao.outputs.MODE }}
-      platform: ${{ steps.bao.outputs.PLATFORM }}
+      mode:     ${{ steps.target.outputs.mode }}
+      platform: ${{ steps.target.outputs.platform }}
     steps:
-      - name: Look up target '${{ inputs.target }}'
-        id: bao
+      # Log in only: values vault-action reads are masked, and GitHub drops masked job outputs
+      - name: OpenBao login
         uses: hashicorp/vault-action@v3
         with:
           url: ${{ inputs.bao_addr }}
           method: jwt
           role: deploy
           jwtGithubAudience: openbao
-          secrets: |
-            kv/data/shared/targets/${{ inputs.target }} mode     | MODE ;
-            kv/data/shared/targets/${{ inputs.target }} platform | PLATFORM
+          exportToken: true
+
+      - name: Look up target '${{ inputs.target }}'
+        id: target
+        env:
+          BAO_ADDR: ${{ inputs.bao_addr }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          T=$(curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" "$BAO_ADDR/v1/kv/data/shared/targets/$TARGET") \
+            || { echo "::error::No target '$TARGET' in OpenBao (bin/register-target --list)"; exit 1; }
+          MODE=$(jq -r '.data.data.mode // empty' <<<"$T")
+          PLATFORM=$(jq -r '.data.data.platform // "linux/amd64"' <<<"$T")
+          [ "$MODE" = tunnel ] || [ "$MODE" = public ] || { echo "::error::Target '$TARGET' has mode '$MODE'"; exit 1; }
+          echo "mode=$MODE"         >> "$GITHUB_OUTPUT"
+          echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
+          echo "Target $TARGET: $MODE, $PLATFORM"
 
   build:
     needs: plan
@@ -92,6 +106,7 @@ jobs:
       - name: Prepare bundle
         run: |
           set -euo pipefail
+          [ "$MODE" = tunnel ] || [ "$MODE" = public ] || { echo "::error::Deploy mode is '$MODE' (expected tunnel or public)"; exit 1; }
           bao_get() { curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" "$BAO_ADDR/v1/kv/data/$1"; }
           REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' \
                  | sed -E 's/[^a-z0-9-]+/-/g; s/^-+|-+$//g')
