@@ -87,10 +87,9 @@ if [[ "$MODE" == public ]]; then
     bao kv put -mount=kv tls/origin cert=@"$PEM" key=@"$KEYF" >/dev/null
     ok "stored in kv/tls/origin — you can now delete the local files (shred -u)"
   fi
-  bao kv get -mount=kv -field=cert tls/origin \
-    | ssh "$SSH_TO" "sudo install -d -m 750 $STACK_DIR/caddy/certs && sudo install -m 644 /dev/stdin $STACK_DIR/caddy/certs/origin.pem"
-  bao kv get -mount=kv -field=key tls/origin \
-    | ssh "$SSH_TO" "sudo install -m 600 /dev/stdin $STACK_DIR/caddy/certs/origin.key && (sudo docker restart caddy >/dev/null 2>&1 || true)"
+  bao kv get -mount=kv -field=cert tls/origin | remote_sudo_install "$SSH_TO" "$STACK_DIR/caddy/certs/origin.pem" 644
+  bao kv get -mount=kv -field=key  tls/origin | remote_sudo_install "$SSH_TO" "$STACK_DIR/caddy/certs/origin.key" 600
+  ssh -t "$SSH_TO" "sudo docker restart caddy >/dev/null 2>&1 || true"
   ok "installed on $SSH_TO:$STACK_DIR/caddy/certs"
 fi
 

@@ -47,6 +47,16 @@ load_config() {
   export INFRA_REPO BAO_VERSION STACK_DIR APPS_DIR TUNNEL_NAME SNAPSHOT_KEEP_DAYS SSH_ADMIN_USERS
 }
 
+# Write stdin to a root-owned file on a remote host. sudo needs a terminal for its
+# password prompt, so the content goes to a private temp file first, then a second
+# ssh -t session runs sudo interactively.  usage: ... | remote_sudo_install <host> <dest> <mode>
+remote_sudo_install() {
+  local host="$1" dest="$2" mode="$3" tmp
+  tmp="/tmp/.infra-$$-$RANDOM"
+  ssh "$host" "umask 077; cat > $tmp" || return 1
+  ssh -t "$host" "sudo install -D -m $mode $tmp $dest; rc=\$?; rm -f $tmp; exit \$rc"
+}
+
 # Render a template with only the listed variables substituted (leaves other $ alone).
 # usage: render <template> <dest> VAR1 VAR2 ...
 render() {

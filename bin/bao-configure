@@ -38,7 +38,7 @@ EOF
   local t
   t=$(bao token create -policy=snapshot -period=768h -orphan -display-name=backup -field=token)
   if [[ -n "$SERVER" ]]; then
-    printf '%s' "$t" | ssh "$SERVER" "sudo install -m 600 /dev/stdin $STACK_DIR/openbao/backup.token"
+    printf '%s' "$t" | remote_sudo_install "$SERVER" "$STACK_DIR/openbao/backup.token" 600
     ok "installed at $SERVER:$STACK_DIR/openbao/backup.token"
   else
     ok "put this in $STACK_DIR/openbao/backup.token on the OpenBao host (chmod 600):"
