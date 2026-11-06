@@ -87,11 +87,17 @@ bao write auth/jwt/config \
   bound_issuer=https://token.actions.githubusercontent.com >/dev/null
 ACCESSOR=$(bao auth list -format=json | jq -r '."jwt/".accessor')
 
-bao policy write ci - >/dev/null <<EOF
+# The template fills in the repo identity "owner/repo". OpenBao blocks slashes in template
+# substitutions unless the policy allows them (and `bao policy write` always resets that flag),
+# so write it through the API. Safe here: the JWT role pins the owner, and GitHub repo
+# names can't contain further slashes; wildcards stay blocked.
+CI_POLICY=$(cat <<EOF
 path "kv/data/shared/*" { capabilities = ["read"] }
 path "ssh/sign/deploy"  { capabilities = ["update"] }
 path "kv/data/apps/{{identity.entity.aliases.${ACCESSOR}.name}}/prod" { capabilities = ["read"] }
 EOF
+)
+bao write sys/policies/acl/ci policy="$CI_POLICY" allow_slashes_in_identity_templates=true >/dev/null
 bao policy write admin - >/dev/null <<'EOF'
 path "*" { capabilities = ["create","read","update","delete","list","sudo"] }
 EOF
