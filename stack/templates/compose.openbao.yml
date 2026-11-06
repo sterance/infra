@@ -1,0 +1,20 @@
+# Rendered by bootstrap.sh
+services:
+  openbao:
+    image: quay.io/openbao/openbao:${BAO_VERSION}
+    container_name: openbao
+    command: ["bao", "server", "-config=/openbao/config/config.hcl"]
+    restart: unless-stopped
+    mem_swappiness: 0
+    ports: ["127.0.0.1:8200:8200"]
+    environment:
+      BAO_ADDR: http://127.0.0.1:8200
+    volumes:
+      - ${STACK_DIR}/openbao/config:/openbao/config:ro
+      - ${STACK_DIR}/openbao/file:/openbao/file
+      - ${STACK_DIR}/openbao/secrets:/openbao/secrets:ro
+      - ${STACK_DIR}/openbao/snapshots:/openbao/snapshots
+    networks: [edge]
+
+networks:
+  edge: { external: true }

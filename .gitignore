@@ -1,0 +1,7 @@
+# Local config and anything secret never goes into git
+config.env
+*.key
+*.pem
+*.snap
+*.json.secret
+INIT-OUTPUT*.txt

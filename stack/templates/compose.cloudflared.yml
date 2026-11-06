@@ -1,0 +1,12 @@
+# Rendered by bootstrap.sh
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --config /etc/cloudflared/config.yml run
+    restart: unless-stopped
+    volumes: ["${STACK_DIR}/cloudflared:/etc/cloudflared:ro"]
+    networks: [edge]
+
+networks:
+  edge: { external: true }

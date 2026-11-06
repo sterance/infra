@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# bao-ssh-cert — get a 12-hour SSH certificate for ~/.ssh/id_ed25519, signed by OpenBao.
+# Servers set up by bootstrap.sh only accept OpenBao-signed certificates.
+#   SSH_PRINCIPALS (default "ubuntu,deploy,gha") = the Linux users the cert is valid for.
+#   SSH_KEY (default ~/.ssh/id_ed25519)
+set -euo pipefail
+KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+[[ -f "$KEY.pub" ]] || { echo "No $KEY.pub — create one: ssh-keygen -t ed25519" >&2; exit 1; }
+bao write -field=signed_key ssh/sign/admin \
+  public_key=@"$KEY.pub" valid_principals="${SSH_PRINCIPALS:-ubuntu,deploy,gha}" > "$KEY-cert.pub"
+ssh-keygen -Lf "$KEY-cert.pub" | grep -E 'Valid:' | sed 's/^ */  ssh cert /'

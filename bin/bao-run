@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# bao-run — run a command with the current repo's secrets from OpenBao as environment variables.
+#   usage: bao-run [dev|prod] -- <command…>     (run inside the app repo; default: dev)
+#   e.g.   bao-run -- npm run dev
+#          bao-run prod -- ./scripts/migrate.sh
+# Secrets come from kv/apps/<owner>/<repo>/<env>; nothing is written to disk.
+set -euo pipefail
+: "${BAO_ADDR:?set BAO_ADDR (e.g. in ~/.bashrc: export BAO_ADDR=https://bao.example.com)}"
+ENV=dev
+if [[ "${1:-}" != "--" && -n "${1:-}" ]]; then ENV=$1; shift; fi
+[[ "${1:-}" == "--" ]] && shift
+[[ $# -gt 0 ]] || { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+SLUG=$(git remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')
+JSON=$(bao kv get -format=json -mount=kv "apps/${SLUG}/${ENV}") \
+  || { echo "bao-run: no secrets at kv/apps/${SLUG}/${ENV} (or not logged in — run bao-day)" >&2; exit 1; }
+eval "$(jq -r '.data.data | to_entries[] | "export \(.key)=\(.value|@sh)"' <<<"$JSON")"
+exec "$@"

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# bao-day — morning routine: log in to OpenBao, sign your SSH cert, load your GitHub key into ssh-agent.
+#   BAO_ADMIN_USER (default "me")
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+: "${BAO_ADDR:?set BAO_ADDR (e.g. in ~/.bashrc: export BAO_ADDR=https://bao.example.com)}"
+bao token lookup >/dev/null 2>&1 || bao login -no-print -method=userpass username="${BAO_ADMIN_USER:-me}"
+"$HERE/bao-ssh-cert"
+if bao kv get -mount=kv ssh/github >/dev/null 2>&1; then
+  bao kv get -mount=kv -field=private_key ssh/github | ssh-add -t 12h - 2>/dev/null \
+    && echo "  GitHub key loaded for 12h" \
+    || echo "  Couldn't reach ssh-agent — start one: eval \"\$(ssh-agent -s)\"" >&2
+else
+  echo "  (no kv/ssh/github yet — see README: Git pushes)"
+fi

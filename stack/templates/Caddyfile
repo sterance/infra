@@ -1,0 +1,7 @@
+# Rendered by bootstrap.sh. Each deployed app adds sites/<repo>.caddy.
+{
+  # Tunnel mode: Cloudflare terminates TLS. Public mode: sites name the Origin CA cert explicitly.
+  auto_https off
+}
+
+import /etc/caddy/sites/*.caddy

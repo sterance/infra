@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# bao-configure — apply the OpenBao configuration this pipeline needs. Idempotent; run from your laptop.
+#
+#   First run (new OpenBao):  BAO_TOKEN=<root token from INIT-OUTPUT.txt> bin/bao-configure --server me@homeserver
+#   Later runs:               bin/bao-configure            (as your admin login, after config changes)
+#   Backup token only:        bin/bao-configure --backup-token [--server me@homeserver]
+#
+# Sets up: audit log, KV v2 at kv/, SSH CA + roles, GitHub Actions JWT auth + policies,
+# your userpass login, kv/shared/cloudflare and kv/shared/ghcr (prompts for missing values),
+# and a periodic snapshot token. --server copies that token to the OpenBao host over SSH.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$0")/../lib/common.sh"
+load_config
+need bao jq
+export BAO_ADDR
+SSH_ADMIN_USERS="${SSH_ADMIN_USERS:-ubuntu}"
+BAO_ADMIN_USER="${BAO_ADMIN_USER:-me}"
+
+ONLY_BACKUP=0; SERVER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backup-token) ONLY_BACKUP=1 ;;
+    --server) SERVER="$2"; shift ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+bao token lookup >/dev/null 2>&1 || die "No OpenBao token. First run: BAO_TOKEN=<root token> $0. Later: bao login -method=userpass username=$BAO_ADMIN_USER"
+
+issue_backup_token() {
+  step "Snapshot token"
+  bao policy write snapshot - >/dev/null <<'EOF'
+path "sys/storage/raft/snapshot" { capabilities = ["read"] }
+EOF
+  local t
+  t=$(bao token create -policy=snapshot -period=768h -orphan -display-name=backup -field=token)
+  if [[ -n "$SERVER" ]]; then
+    printf '%s' "$t" | ssh "$SERVER" "sudo install -m 600 /dev/stdin $STACK_DIR/openbao/backup.token"
+    ok "installed at $SERVER:$STACK_DIR/openbao/backup.token"
+  else
+    ok "put this in $STACK_DIR/openbao/backup.token on the OpenBao host (chmod 600):"
+    echo "      $t"
+  fi
+}
+
+if (( ONLY_BACKUP )); then issue_backup_token; exit 0; fi
+
+# ---------------------------------------------------------------- engines
+step "Engines"
+bao audit list -format=json 2>/dev/null | jq -e '."file/"' >/dev/null \
+  || bao audit enable file file_path=stdout >/dev/null
+ok "audit log → docker logs openbao"
+MOUNTS=$(bao secrets list -format=json)
+jq -e '."kv/"'  >/dev/null <<<"$MOUNTS" || bao secrets enable -path=kv kv-v2 >/dev/null
+jq -e '."ssh/"' >/dev/null <<<"$MOUNTS" || bao secrets enable -path=ssh ssh >/dev/null
+ok "kv/ (KV v2) and ssh/"
+
+# ---------------------------------------------------------------- SSH CA
+step "SSH certificate authority"
+if ! bao read -field=public_key ssh/config/ca >/dev/null 2>&1; then
+  bao write ssh/config/ca generate_signing_key=true key_type=ed25519 >/dev/null
+  ok "generated CA key"
+fi
+bao write ssh/roles/admin - >/dev/null <<EOF
+{"key_type":"ca","allow_user_certificates":true,"allowed_users":"$SSH_ADMIN_USERS,deploy,gha",
+ "default_user":"${SSH_ADMIN_USERS%%,*}","ttl":"12h","max_ttl":"24h",
+ "default_extensions":{"permit-pty":"","permit-port-forwarding":"","permit-agent-forwarding":""}}
+EOF
+bao write ssh/roles/deploy - >/dev/null <<'EOF'
+{"key_type":"ca","allow_user_certificates":true,"allowed_users":"deploy",
+ "default_user":"deploy","ttl":"10m","max_ttl":"30m"}
+EOF
+ok "roles: admin (12h, $SSH_ADMIN_USERS,deploy,gha) and deploy (10m, deploy)"
+
+# ---------------------------------------------------------------- auth + policies
+step "Auth and policies"
+AUTHS=$(bao auth list -format=json)
+jq -e '."jwt/"' >/dev/null <<<"$AUTHS" || bao auth enable jwt >/dev/null
+bao write auth/jwt/config \
+  oidc_discovery_url=https://token.actions.githubusercontent.com \
+  bound_issuer=https://token.actions.githubusercontent.com >/dev/null
+ACCESSOR=$(bao auth list -format=json | jq -r '."jwt/".accessor')
+
+bao policy write ci - >/dev/null <<EOF
+path "kv/data/shared/*" { capabilities = ["read"] }
+path "ssh/sign/deploy"  { capabilities = ["update"] }
+path "kv/data/apps/{{identity.entity.aliases.${ACCESSOR}.name}}/prod" { capabilities = ["read"] }
+EOF
+bao policy write admin - >/dev/null <<'EOF'
+path "*" { capabilities = ["create","read","update","delete","list","sudo"] }
+EOF
+bao write auth/jwt/role/deploy - >/dev/null <<EOF
+{"role_type":"jwt","user_claim":"repository","bound_audiences":["openbao"],
+ "bound_claims":{"repository_owner":"$GH_OWNER","ref":"refs/heads/main"},
+ "token_policies":["ci"],"token_ttl":"10m","token_max_ttl":"15m"}
+EOF
+ok "GitHub Actions: role 'deploy' for $GH_OWNER/* on main, policy 'ci'"
+
+jq -e '."userpass/"' >/dev/null <<<"$AUTHS" || bao auth enable userpass >/dev/null
+if bao read "auth/userpass/users/$BAO_ADMIN_USER" >/dev/null 2>&1; then
+  ok "userpass login '$BAO_ADMIN_USER' exists"
+else
+  while :; do
+    read -rsp "  New password for OpenBao user '$BAO_ADMIN_USER': " P1; echo
+    read -rsp "  Again: " P2; echo
+    [[ -n "$P1" && "$P1" == "$P2" ]] && break
+    warn "empty or didn't match, try again"
+  done
+  bao write "auth/userpass/users/$BAO_ADMIN_USER" password="$P1" \
+    token_policies=admin token_ttl=12h token_max_ttl=24h >/dev/null
+  unset P1 P2
+  ok "created userpass login '$BAO_ADMIN_USER' (policy admin, 12h tokens)"
+fi
+
+# ---------------------------------------------------------------- shared secrets
+step "Shared secrets"
+CF=$(bao kv get -mount=kv -format=json shared/cloudflare 2>/dev/null | jq -c '.data.data' || echo '{}')
+cfget() { jq -r --arg k "$1" '.[$k] // empty' <<<"$CF"; }
+ask() {  # ask <key> <prompt> [secret]
+  local cur; cur=$(cfget "$1")
+  if [[ -n "$cur" ]]; then printf '%s' "$cur"; return; fi
+  local v
+  if [[ "${3:-}" == secret ]]; then read -rsp "  $2: " v; echo >&2; else read -rp "  $2: " v; fi
+  printf '%s' "$v"
+}
+echo "  Cloudflare API token needs: Account·Cloudflare Pages·Edit, Zone·DNS·Edit, Zone·Zone·Read (zone $DOMAIN)" >&2
+TOK=$(ask api_token "Cloudflare API token" secret)
+ACC=$(ask account_id "Cloudflare account ID")
+ZONE=$(ask zone_id "Cloudflare zone ID for $DOMAIN")
+[[ -n "$TOK" && -n "$ACC" && -n "$ZONE" ]] || die "Cloudflare values are required"
+bao kv put -mount=kv shared/cloudflare api_token="$TOK" account_id="$ACC" zone_id="$ZONE" domain="$DOMAIN" >/dev/null
+ok "kv/shared/cloudflare"
+
+if bao kv get -mount=kv shared/ghcr >/dev/null 2>&1; then
+  ok "kv/shared/ghcr exists"
+else
+  echo "  GHCR pull token for servers: a GitHub classic PAT with only read:packages." >&2
+  read -rsp "  Token (empty to skip if your images are public): " GT; echo
+  if [[ -n "$GT" ]]; then
+    bao kv put -mount=kv shared/ghcr username="$GH_OWNER" token="$GT" >/dev/null; ok "kv/shared/ghcr"
+  else
+    bao kv put -mount=kv shared/ghcr username="$GH_OWNER" token="" >/dev/null
+    warn "kv/shared/ghcr has no token — set one later if images are private"
+  fi
+  unset GT
+fi
+
+issue_backup_token
+
+step "Done"
+echo "  • Log in as yourself:  bao login -method=userpass username=$BAO_ADMIN_USER"
+echo "  • If you used the root token, revoke it once that works:  bao token revoke <root token>"
+echo "    (a new one can be made later with 'bao operator generate-root' + 2 recovery keys)"
+echo "  • Re-run bootstrap.sh on each server so sshd trusts the SSH CA."

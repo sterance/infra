@@ -1,0 +1,15 @@
+# Rendered by bootstrap.sh — app proxy on public :443 with the Cloudflare Origin certificate
+services:
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    restart: unless-stopped
+    ports: ["443:443"]
+    volumes:
+      - ${STACK_DIR}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${STACK_DIR}/caddy/sites:/etc/caddy/sites:ro
+      - ${STACK_DIR}/caddy/certs:/certs:ro
+    networks: [edge]
+
+networks:
+  edge: { external: true }

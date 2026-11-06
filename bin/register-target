@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# register-target — record a deploy target in OpenBao (kv/shared/targets/<name>) for deploy-backend.yml.
+#
+#   bin/register-target oracle --mode public --host 152.67.1.2 [--ssh ubuntu@152.67.1.2]
+#   bin/register-target home   --mode tunnel --tunnel-id 6ff42ae2-… [--ssh me@homeserver]
+#   bin/register-target --list
+#   bin/register-target --remove oracle
+#
+# public: pins the SSH host key, installs the Cloudflare Origin certificate on the server
+#         (prompts for origin.pem/origin.key the first time and keeps them in kv/tls/origin).
+# tunnel: the name is also the self-hosted runner label (bootstrap.sh prints the exact command).
+# --ssh is used to detect the CPU architecture (and, for public, to install the cert);
+# it relies on your OpenBao SSH cert (bao-ssh-cert) or any key the server already accepts.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$0")/../lib/common.sh"
+load_config
+need bao jq
+export BAO_ADDR
+
+NAME="" ; MODE="" ; HOST="" ; TUNNEL_ID="" ; SSH_TO="" ; PLATFORM=""
+case "${1:-}" in
+  --list)
+    bao kv list -mount=kv -format=json shared/targets 2>/dev/null | jq -r '.[]' | while read -r t; do
+      printf '  %-12s %s\n' "$t" "$(bao kv get -mount=kv -format=json "shared/targets/$t" \
+        | jq -r '.data.data | "\(.mode)  \(.platform)  \(.host // .tunnel_id)"')"
+    done
+    exit 0 ;;
+  --remove)
+    [[ -n "${2:-}" ]] || die "usage: register-target --remove <name>"
+    bao kv metadata delete -mount=kv "shared/targets/$2" >/dev/null; ok "removed target $2"; exit 0 ;;
+  -h|--help|"") sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+NAME="$1"; shift
+[[ "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Target names are lower-case letters, digits and dashes"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode) MODE="$2"; shift ;;
+    --host) HOST="$2"; shift ;;
+    --tunnel-id) TUNNEL_ID="$2"; shift ;;
+    --ssh) SSH_TO="$2"; shift ;;
+    --platform) PLATFORM="$2"; shift ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+[[ -z "$SSH_TO$HOST" ]] || need ssh ssh-keyscan
+bao token lookup >/dev/null 2>&1 || die "Log in first: bao login -method=userpass username=${BAO_ADMIN_USER:-me}"
+
+case "$MODE" in
+  public) [[ -n "$HOST" ]] || die "--mode public needs --host <public IP or hostname>"
+          SSH_TO="${SSH_TO:-${SSH_ADMIN_USERS%%,*}@$HOST}" ;;
+  tunnel) [[ -n "$TUNNEL_ID" ]] || die "--mode tunnel needs --tunnel-id (bootstrap.sh prints it)" ;;
+  *) die "--mode must be public or tunnel" ;;
+esac
+
+step "Target '$NAME' ($MODE)"
+if [[ -z "$PLATFORM" && -n "$SSH_TO" ]]; then
+  ARCH=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_TO" uname -m 2>/dev/null || true)
+  case "$ARCH" in x86_64) PLATFORM=linux/amd64 ;; aarch64|arm64) PLATFORM=linux/arm64 ;; esac
+  [[ -n "$PLATFORM" ]] && ok "detected $PLATFORM on $SSH_TO"
+fi
+if [[ -z "$PLATFORM" ]]; then
+  PLATFORM=linux/amd64
+  warn "couldn't detect the architecture; assuming $PLATFORM (override with --platform linux/arm64)"
+fi
+
+ARGS=(mode="$MODE" platform="$PLATFORM" stack_dir="$STACK_DIR" apps_dir="$APPS_DIR")
+if [[ "$MODE" == public ]]; then
+  KH=$(ssh-keyscan -t ed25519 "$HOST" 2>/dev/null)
+  [[ -n "$KH" ]] || die "ssh-keyscan $HOST returned nothing — is port 22 reachable?"
+  ok "pinned host key for $HOST"
+  ARGS+=(host="$HOST" known_hosts="$KH")
+else
+  ARGS+=(tunnel_id="$TUNNEL_ID")
+fi
+bao kv put -mount=kv "shared/targets/$NAME" "${ARGS[@]}" >/dev/null
+ok "saved kv/shared/targets/$NAME"
+
+if [[ "$MODE" == public ]]; then
+  step "Cloudflare Origin certificate"
+  if ! bao kv get -mount=kv tls/origin >/dev/null 2>&1; then
+    echo "  Create one: Cloudflare → SSL/TLS → Origin Server → Create certificate (*.$DOMAIN, $DOMAIN, 15 years)."
+    echo "  Also set SSL/TLS mode to Full (strict)."
+    read -rp "  Path to origin.pem: " PEM; read -rp "  Path to origin.key: " KEYF
+    [[ -f "$PEM" && -f "$KEYF" ]] || die "files not found"
+    bao kv put -mount=kv tls/origin cert=@"$PEM" key=@"$KEYF" >/dev/null
+    ok "stored in kv/tls/origin — you can now delete the local files (shred -u)"
+  fi
+  bao kv get -mount=kv -field=cert tls/origin \
+    | ssh "$SSH_TO" "sudo install -d -m 750 $STACK_DIR/caddy/certs && sudo install -m 644 /dev/stdin $STACK_DIR/caddy/certs/origin.pem"
+  bao kv get -mount=kv -field=key tls/origin \
+    | ssh "$SSH_TO" "sudo install -m 600 /dev/stdin $STACK_DIR/caddy/certs/origin.key && (sudo docker restart caddy >/dev/null 2>&1 || true)"
+  ok "installed on $SSH_TO:$STACK_DIR/caddy/certs"
+fi
+
+step "Done"
+echo "  Backends deploy here with:  bin/onboard-repo.sh <repo> --backend --target $NAME"
+[[ "$MODE" == tunnel ]] && echo "  Runners for this target need the label '$NAME' (onboard-repo.sh --runner-ssh handles it)."
+exit 0
