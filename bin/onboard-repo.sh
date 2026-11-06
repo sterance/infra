@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # onboard-repo.sh — wire a GitHub repo into the OpenBao + Cloudflare deploy pipeline.
 #
-# Run from your laptop after `bao-day` (needs: gh, bao, jq, git, base64; ssh for --runner-ssh).
+# Run from your laptop after `bao-day` (needs: gh, bao, jq, git, base64).
 # Reads config.env from this infra repo. Idempotent: safe to re-run on the same repo.
 #
 # Examples
 #   bin/onboard-repo.sh --frontend                                   # repo from current dir
 #   bin/onboard-repo.sh jdoe/site --frontend --subdomain www --output-dir build
 #   bin/onboard-repo.sh jdoe/api --backend --target oracle --prod-env .env.prod --dev-env .env
-#   bin/onboard-repo.sh jdoe/worker --backend --target home --runner-ssh me@homeserver
+#   bin/onboard-repo.sh jdoe/worker --backend --target home --dockerfile server/Dockerfile --data-dir /app/data
 #   bin/onboard-repo.sh jdoe/api --backend --target oracle --pr --dry-run
 
 set -euo pipefail
@@ -31,7 +31,6 @@ Options
     --dockerfile PATH     Dockerfile path from the repo root (default Dockerfile)
     --context DIR         Docker build context (default .)
     --data-dir PATH       Container path to persist across deploys, e.g. /app/data
-    --runner-ssh U@HOST   Tunnel targets on personal accounts: register this repo's runner over SSH
   Secrets:
     --prod-env FILE       Import KEY=VALUE file into kv/apps/<owner>/<repo>/prod
     --dev-env FILE        Import KEY=VALUE file into kv/apps/<owner>/<repo>/dev
@@ -44,7 +43,7 @@ EOF
 }
 
 REPO_ARG="" ; KIND="" ; TARGET="" ; SUBDOMAIN="" ; OUTPUT_DIR="" ; BUILD_CMD=""
-NODE_VERSION="" ; PORT="" ; DEV_ENV="" ; PROD_ENV="" ; RUNNER_SSH="" ; USE_PR=0 ; DRY=0 ; YES=0 ; T_MODE=""
+NODE_VERSION="" ; PORT="" ; DEV_ENV="" ; PROD_ENV="" ; USE_PR=0 ; DRY=0 ; YES=0 ; T_MODE=""
 DOCKERFILE="" ; CONTEXT="" ; DATA_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     --data-dir) DATA_DIR="$2"; shift ;;
     --prod-env) PROD_ENV="$2"; shift ;;
     --dev-env) DEV_ENV="$2"; shift ;;
-    --runner-ssh|--home-ssh) RUNNER_SSH="$2"; shift ;;
+    --runner-ssh|--home-ssh) warn "$1 is no longer needed: all targets deploy over SSH from GitHub's runners"; shift ;;
     --pr) USE_PR=1 ;;
     -n|--dry-run) DRY=1 ;;
     -y|--yes) YES=1 ;;
@@ -118,7 +117,6 @@ set_var() {  # set_var NAME VALUE
 step "Preflight"
 load_config
 need gh bao jq git base64
-[[ -z "$RUNNER_SSH" ]] || need ssh
 export BAO_ADDR
 gh auth status >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
 bao token lookup >/dev/null 2>&1 || die "No valid OpenBao token (run: bao-day)"
@@ -131,7 +129,7 @@ if [[ "$KIND" == backend ]]; then
     || die "Unknown target '$TARGET'. Registered: $(bao kv list -mount=kv -format=json shared/targets 2>/dev/null | jq -r 'join(", ")' || echo none)"
   T_MODE=$(jq -r .data.data.mode <<<"$T_JSON")
 else
-  [[ -z "$TARGET$PORT$RUNNER_SSH$DOCKERFILE$CONTEXT$DATA_DIR" ]] || die "--target/--port/--dockerfile/--context/--data-dir/--runner-ssh are backend-only"
+  [[ -z "$TARGET$PORT$DOCKERFILE$CONTEXT$DATA_DIR" ]] || die "--target/--port/--dockerfile/--context/--data-dir are backend-only"
 fi
 [[ -z "$PROD_ENV" || -f "$PROD_ENV" ]] || die "Not a file: $PROD_ENV"
 [[ -z "$DEV_ENV"  || -f "$DEV_ENV"  ]] || die "Not a file: $DEV_ENV"
@@ -153,8 +151,8 @@ OWNER_TYPE=$(gh api "users/$OWNER" --jq .type)    # User | Organization
 
 [[ "$OWNER" == "$GH_OWNER" ]] || warn "$FULL is owned by $OWNER, but OpenBao only trusts GitHub Actions from $GH_OWNER (config.env)."
 [[ "$BRANCH" == main ]] || warn "Default branch is '$BRANCH'; the pipeline only deploys from 'main'."
-if [[ "$KIND" == backend && "$T_MODE" == tunnel && "$VIS" == PUBLIC ]]; then
-  die "$FULL is public. Tunnel targets deploy on a self-hosted runner, which must only serve private repos."
+if [[ "$KIND" == backend && "$T_MODE" == tunnel ]] && ! bao kv get -mount=kv shared/cloudflare-access >/dev/null 2>&1; then
+  die "Tunnel target '$TARGET' has no Access service token yet — re-run: register-target $TARGET --mode tunnel …"
 fi
 gh repo view "$INFRA_REPO" >/dev/null 2>&1 || die "Infra repo '$INFRA_REPO' not found (INFRA_REPO in config.env)"
 
@@ -222,51 +220,7 @@ step "Repo variables"
 set_var BAO_ADDR "$BAO_ADDR"
 [[ "$KIND" == backend ]] && set_var DEPLOY_TARGET "$TARGET"
 
-# ---------------------------------------------------------------- 4. runner (tunnel targets)
-if [[ "$KIND" == backend && "$T_MODE" == tunnel ]]; then
-  step "Self-hosted runner (label '$TARGET')"
-  if [[ "$OWNER_TYPE" == Organization ]]; then
-    if gh api "orgs/$OWNER/actions/runners" --jq '.runners[].labels[].name' 2>/dev/null | grep -qx "$TARGET"; then
-      ok "org-level runner labelled '$TARGET' found"
-    else
-      warn "no org runner labelled '$TARGET' — register one: bootstrap.sh --role runner --runner-url https://github.com/$OWNER --runner-token … --runner-label $TARGET"
-    fi
-  elif gh api "repos/$FULL/actions/runners" --jq '.runners[].labels[].name' 2>/dev/null | grep -qx "$TARGET"; then
-    ok "repo already has a runner labelled '$TARGET'"
-  elif [[ -n "$RUNNER_SSH" ]]; then
-    VER=$(gh api repos/actions/runner/releases/latest --jq .tag_name); VER="${VER#v}"
-    if (( DRY )); then
-      printf '  %s[dry-run]%s register runner %s-%s (actions/runner %s) on %s\n' "$c_dim" "$c_off" "$TARGET" "$REPO_SLUG" "$VER" "$RUNNER_SSH"
-    else
-      TOKEN=$(gh api -X POST "repos/$FULL/actions/runners/registration-token" --jq .token)
-      REMOTE=$(mktemp)
-      cat > "$REMOTE" <<EOF
-set -euo pipefail
-id gha >/dev/null 2>&1 || { echo "user 'gha' missing — run bootstrap.sh --role runner first"; exit 1; }
-DIR=/home/gha/runner-$REPO_SLUG
-if [ -f "\$DIR/.runner" ]; then echo "runner already configured in \$DIR"; exit 0; fi
-case "\$(uname -m)" in x86_64) A=x64 ;; aarch64|arm64) A=arm64 ;; *) echo "unsupported arch"; exit 1 ;; esac
-install -d -o gha -g gha "\$DIR"
-cd "\$DIR"
-sudo -u gha curl -fsSL -o runner.tgz "https://github.com/actions/runner/releases/download/v$VER/actions-runner-linux-\$A-$VER.tar.gz"
-sudo -u gha tar xzf runner.tgz && rm -f runner.tgz
-sudo -u gha ./config.sh --unattended --replace --url "https://github.com/$FULL" --token "$TOKEN" \
-  --name "$TARGET-$REPO_SLUG" --labels "$TARGET"
-./svc.sh install gha
-./svc.sh start
-EOF
-      R="/tmp/onboard-runner-$$.sh"
-      ssh "$RUNNER_SSH" "umask 077; cat > $R" < "$REMOTE"; rm -f "$REMOTE"
-      ssh -t "$RUNNER_SSH" "sudo bash $R; rc=\$?; rm -f $R; exit \$rc"
-      ok "runner $TARGET-$REPO_SLUG registered on $RUNNER_SSH"
-    fi
-  else
-    warn "personal account: this repo needs its own runner. Re-run with --runner-ssh you@server,"
-    warn "or register one by hand (Repo → Settings → Actions → Runners) with the label '$TARGET'."
-  fi
-fi
-
-# ---------------------------------------------------------------- 5. caller workflow
+# ---------------------------------------------------------------- 4. caller workflow
 step "Caller workflow"
 WITH=('bao_addr: ${{ vars.BAO_ADDR }}')
 if [[ "$KIND" == frontend ]]; then

@@ -2,15 +2,17 @@
 # register-target — record a deploy target in OpenBao (kv/shared/targets/<name>) for deploy-backend.yml.
 #
 #   bin/register-target oracle --mode public --host 152.67.1.2 [--ssh ubuntu@152.67.1.2]
-#   bin/register-target home   --mode tunnel --tunnel-id 6ff42ae2-… [--ssh me@homeserver]
+#   bin/register-target home   --mode tunnel --tunnel-id 6ff42ae2-… --ssh me@homeserver [--ssh-host ssh-home.example.com]
 #   bin/register-target --list
 #   bin/register-target --remove oracle
 #
 # public: pins the SSH host key, installs the Cloudflare Origin certificate on the server
 #         (prompts for origin.pem/origin.key the first time and keeps them in kv/tls/origin).
-# tunnel: the name is also the self-hosted runner label (bootstrap.sh prints the exact command).
-# --ssh is used to detect the CPU architecture (and, for public, to install the cert);
-# it relies on your OpenBao SSH cert (bao-ssh-cert) or any key the server already accepts.
+# tunnel: GitHub deploys over SSH through the tunnel at --ssh-host (default ssh-<TUNNEL_NAME>.<DOMAIN>,
+#         matching bootstrap.sh). Pins the server's host key under that name, creates its DNS record,
+#         and stores the Cloudflare Access service token that lets deploys through (prompts once).
+# --ssh is how this laptop reaches the server directly (LAN or public IP) to read its architecture,
+# host key and, for public targets, to install the cert. Uses your OpenBao SSH cert (bao-ssh-cert).
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 source "$(dirname "$0")/../lib/common.sh"
@@ -18,12 +20,12 @@ load_config
 need bao jq
 export BAO_ADDR
 
-NAME="" ; MODE="" ; HOST="" ; TUNNEL_ID="" ; SSH_TO="" ; PLATFORM=""
+NAME="" ; MODE="" ; HOST="" ; TUNNEL_ID="" ; SSH_TO="" ; PLATFORM="" ; SSH_HOST=""
 case "${1:-}" in
   --list)
     bao kv list -mount=kv -format=json shared/targets 2>/dev/null | jq -r '.[]' | while read -r t; do
       printf '  %-12s %s\n' "$t" "$(bao kv get -mount=kv -format=json "shared/targets/$t" \
-        | jq -r '.data.data | "\(.mode)  \(.platform)  \(.host // .tunnel_id)"')"
+        | jq -r '.data.data | "\(.mode)  \(.platform)  \(.host // .ssh_host // .tunnel_id)"')"
     done
     exit 0 ;;
   --remove)
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --host) HOST="$2"; shift ;;
     --tunnel-id) TUNNEL_ID="$2"; shift ;;
     --ssh) SSH_TO="$2"; shift ;;
+    --ssh-host) SSH_HOST="$2"; shift ;;
     --platform) PLATFORM="$2"; shift ;;
     *) die "Unknown argument: $1" ;;
   esac
@@ -50,7 +53,10 @@ bao token lookup >/dev/null 2>&1 || die "Log in first: bao login -method=userpas
 case "$MODE" in
   public) [[ -n "$HOST" ]] || die "--mode public needs --host <public IP or hostname>"
           SSH_TO="${SSH_TO:-${SSH_ADMIN_USERS%%,*}@$HOST}" ;;
-  tunnel) [[ -n "$TUNNEL_ID" ]] || die "--mode tunnel needs --tunnel-id (bootstrap.sh prints it)" ;;
+  tunnel) [[ -n "$TUNNEL_ID" ]] || die "--mode tunnel needs --tunnel-id (bootstrap.sh prints it)"
+          [[ -n "$SSH_TO" ]]    || die "--mode tunnel needs --ssh user@server (to read its host key)"
+          SSH_HOST="${SSH_HOST:-ssh-$TUNNEL_NAME.$DOMAIN}"
+          need curl ;;
   *) die "--mode must be public or tunnel" ;;
 esac
 
@@ -72,10 +78,44 @@ if [[ "$MODE" == public ]]; then
   ok "pinned host key for $HOST"
   ARGS+=(host="$HOST" known_hosts="$KH")
 else
-  ARGS+=(tunnel_id="$TUNNEL_ID")
+  HK=$(ssh -o ConnectTimeout=10 "$SSH_TO" cat /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $1, $2}')
+  [[ "$HK" == ssh-ed25519\ * ]] || die "couldn't read /etc/ssh/ssh_host_ed25519_key.pub on $SSH_TO"
+  ok "pinned host key as $SSH_HOST"
+  ARGS+=(tunnel_id="$TUNNEL_ID" ssh_host="$SSH_HOST" known_hosts="$SSH_HOST $HK")
 fi
 bao kv put -mount=kv "shared/targets/$NAME" "${ARGS[@]}" >/dev/null
 ok "saved kv/shared/targets/$NAME"
+
+if [[ "$MODE" == tunnel ]]; then
+  step "DNS for $SSH_HOST"
+  CF_TOKEN=$(bao kv get -mount=kv -field=api_token shared/cloudflare)
+  CF_ZONE=$(bao kv get -mount=kv -field=zone_id shared/cloudflare)
+  AUTH="Authorization: Bearer $CF_TOKEN"; Z="https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records"
+  BODY=$(jq -n --arg n "$SSH_HOST" --arg c "$TUNNEL_ID.cfargotunnel.com" '{type:"CNAME",name:$n,content:$c,proxied:true,ttl:1}')
+  ID=$(curl -fsS -H "$AUTH" "$Z?name=$SSH_HOST" | jq -r '.result[0].id // empty')
+  if [[ -n "$ID" ]]; then curl -fsS -X PUT -H "$AUTH" -H 'Content-Type: application/json' "$Z/$ID" -d "$BODY" >/dev/null
+  else curl -fsS -X POST -H "$AUTH" -H 'Content-Type: application/json' "$Z" -d "$BODY" >/dev/null; fi
+  ok "CNAME $SSH_HOST → tunnel $TUNNEL_ID"
+
+  step "Cloudflare Access service token"
+  if bao kv get -mount=kv shared/cloudflare-access >/dev/null 2>&1; then
+    ok "kv/shared/cloudflare-access exists (shared by all tunnel targets)"
+  else
+    cat <<EOF
+  GitHub's runners reach SSH through Cloudflare Access with a service token. In the Cloudflare dashboard:
+    1. Zero Trust → Access → Service credentials → Service Tokens → Create: name it github-deploy
+       (copy the Client ID and Client Secret — the secret is shown once)
+    2. Zero Trust → Access → Applications → Add → Self-hosted: domain $SSH_HOST
+       Policy: Action "Service Auth", Include → Service Token → github-deploy
+       (add a second policy "Allow" for your own email if you want to SSH in through it too)
+EOF
+    read -rp "  Client ID: " CID; read -rsp "  Client Secret: " CSEC; echo
+    [[ -n "$CID" && -n "$CSEC" ]] || die "both values are required"
+    bao kv put -mount=kv shared/cloudflare-access client_id="$CID" client_secret="$CSEC" >/dev/null
+    unset CSEC
+    ok "stored in kv/shared/cloudflare-access"
+  fi
+fi
 
 if [[ "$MODE" == public ]]; then
   step "Cloudflare Origin certificate"
@@ -95,5 +135,7 @@ fi
 
 step "Done"
 echo "  Backends deploy here with:  bin/onboard-repo.sh <repo> --backend --target $NAME"
-[[ "$MODE" == tunnel ]] && echo "  Runners for this target need the label '$NAME' (onboard-repo.sh --runner-ssh handles it)."
+if [[ "$MODE" == tunnel ]]; then
+  echo "  Deploys SSH in as 'deploy' via $SSH_HOST — make sure its Access application exists before the first deploy."
+fi
 exit 0

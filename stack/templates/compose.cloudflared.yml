@@ -7,6 +7,8 @@ services:
     restart: unless-stopped
     volumes: ["${STACK_DIR}/cloudflared:/etc/cloudflared:ro"]
     networks: [edge]
+    # lets the tunnel's ssh route reach the host's sshd
+    extra_hosts: ["host.docker.internal:host-gateway"]
 
 networks:
   edge: { external: true }

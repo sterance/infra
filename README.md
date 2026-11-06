@@ -15,7 +15,7 @@ run `bootstrap.sh`.
       │
       ├─▶ Cloudflare Pages       <sub>.<DOMAIN>            (deploy-pages.yml)
       ├─▶ public target (VPS)    <repo>-backend.<DOMAIN>   (deploy-backend.yml, over SSH, Caddy on :443)
-      └─▶ tunnel target (home)   <repo>-backend.<DOMAIN>   (deploy-backend.yml, self-hosted runner, via tunnel)
+      └─▶ tunnel target (home)   <repo>-backend.<DOMAIN>   (deploy-backend.yml, SSH through the tunnel)
 ```
 
 ## Layout
@@ -23,7 +23,7 @@ run `bootstrap.sh`.
 | Path | What it is |
 | --- | --- |
 | `config.env.example` | Copy to `config.env` (git-ignored): domain, GitHub owner, versions, paths |
-| `bootstrap.sh` | Sets up or rebuilds a server by role: `bao`, `apps`, `runner` |
+| `bootstrap.sh` | Sets up or rebuilds a server by role: `bao`, `apps` (and optionally `runner`) |
 | `stack/templates/` | Compose, OpenBao, Caddy and snapshot templates that `bootstrap.sh` renders |
 | `.github/workflows/` | Reusable `deploy-pages.yml` and `deploy-backend.yml` that app repos call |
 | `bin/bao-configure` | Applies the OpenBao config: engines, SSH CA, policies, JWT auth, your login |
@@ -36,12 +36,14 @@ run `bootstrap.sh`.
 
 **Roles** (per machine, combine freely):
 - `bao`: OpenBao with static-key auto-unseal, behind this machine's tunnel at `bao.<DOMAIN>`, plus a nightly snapshot.
-- `apps --mode tunnel`: Caddy behind the tunnel. No open ports; deploys run on a self-hosted runner on the machine.
+- `apps --mode tunnel`: Caddy behind the tunnel. No open ports: GitHub deploys over SSH through the tunnel at
+  `ssh-<TUNNEL_NAME>.<DOMAIN>`, which Cloudflare Access only opens for a service token.
 - `apps --mode public`: Caddy on public `:443` with a Cloudflare Origin cert. GitHub deploys over SSH as `deploy`.
-- `runner`: the `gha` user that runs a self-hosted GitHub Actions runner (needed for tunnel-mode apps).
+- `runner` (optional): a `gha` user for a self-hosted GitHub Actions runner. Deploys don't need one.
 
 **Targets** are named servers in `kv/shared/targets/<name>` (e.g. `home`, `oracle`). A backend repo's
-`DEPLOY_TARGET` variable picks one. For tunnel targets, the name is also the runner label.
+`DEPLOY_TARGET` variable picks one. Every deploy runs on GitHub's own runners and logs in as `deploy` with
+a 10-minute OpenBao certificate, so public repos are safe to deploy.
 
 **Offline kit** (print + USB, kept in two places, never in Backblaze):
 - the unseal key (base64) and its KEY_ID
@@ -53,14 +55,14 @@ run `bootstrap.sh`.
 
 ## 1. First-time setup
 
-### 1.1 Home server (OpenBao + apps + runner)
+### 1.1 Home server (OpenBao + apps)
 
 Ubuntu 24.04 with a sudo user. Your domain's DNS must be on Cloudflare.
 
 ```bash
 git clone https://github.com/<GH_OWNER>/infra.git ~/infra && cd ~/infra
 cp config.env.example config.env && nano config.env
-sudo ./bootstrap.sh --role bao,apps,runner
+sudo ./bootstrap.sh --role bao,apps
 ```
 
 The script installs Docker if needed and asks you to log in to Cloudflare once to create the tunnel. It then
@@ -83,7 +85,7 @@ echo 'export PATH="$HOME/infra/bin:$PATH"'   >> ~/.bashrc && source ~/.bashrc
 BAO_TOKEN=<root token> bao-configure --server you@homeserver  # prompts for your password + Cloudflare values
 bao login -method=userpass username=me
 bao token revoke <root token>
-ssh you@homeserver 'cd ~/infra && sudo ./bootstrap.sh --role bao,apps,runner'   # re-run: trusts the SSH CA now
+ssh -t you@homeserver 'cd ~/infra && sudo ./bootstrap.sh --role bao,apps'   # re-run: trusts the SSH CA now
 ```
 
 `bao-configure` creates the Cloudflare API token entry. The token needs **Account · Cloudflare Pages · Edit**,
@@ -95,8 +97,18 @@ ssh you@homeserver 'cd ~/infra && sudo ./bootstrap.sh --role bao,apps,runner'   
 `bootstrap.sh` printed the exact command; it looks like:
 
 ```bash
+bao-ssh-cert                                                       # lets the laptop SSH in with a cert
 register-target home --mode tunnel --tunnel-id <TUNNEL_ID> --ssh you@homeserver
 ```
+
+The first tunnel target asks for a Cloudflare Access **service token** and prints where to make it:
+1. **Zero Trust → Access → Service credentials → Service Tokens → Create**, named `github-deploy`.
+   Copy the Client ID and Secret.
+2. **Zero Trust → Access → Applications → Add → Self-hosted** for `ssh-<TUNNEL_NAME>.<DOMAIN>`, with a
+   **Service Auth** policy that includes that token.
+
+`register-target` also pins the server's SSH host key and creates the `ssh-…` DNS record. Without the Access
+application, anyone could reach your server's SSH through the tunnel, so create it before the first deploy.
 
 ### 1.4 Add a public app server (e.g. Oracle VPS)
 
@@ -140,13 +152,12 @@ Add `/opt/stack/openbao/snapshots` and any app data folders (`/opt/apps/*/data`)
 bao-day                                                        # once a day
 cd ~/code/my-site && onboard-repo.sh --frontend
 onboard-repo.sh jdoe/api --backend --target oracle --prod-env .env.prod --dev-env .env
-onboard-repo.sh jdoe/worker --backend --target home --runner-ssh you@homeserver
+onboard-repo.sh jdoe/worker --backend --target home --dockerfile server/Dockerfile --data-dir /app/data
 onboard-repo.sh jdoe/api --backend --target oracle --pr --dry-run   # preview, then open a PR
 ```
 
 It imports secrets into `kv/apps/<owner>/<repo>/{prod,dev}` and sets the `BAO_ADDR` and `DEPLOY_TARGET`
-repo variables. It commits `.github/workflows/deploy.yml` (or opens a PR), and registers a runner for
-tunnel targets.
+repo variables, and commits `.github/workflows/deploy.yml` (or opens a PR).
 
 - **Backends** need a `Dockerfile` whose app listens on `0.0.0.0:$PORT` (default 8080). Use `--dockerfile
   server/Dockerfile` for one in a subfolder (the build context stays the repo root unless you pass `--context`),
@@ -183,7 +194,7 @@ tunnel targets.
    base64 -d | sudo tee /opt/stack/openbao/secrets/unseal.key >/dev/null        # paste, Ctrl-D
    sudo cp <TUNNEL_ID>.json /opt/stack/cloudflared/                              # keeps the same tunnel
    ```
-4. `sudo ./bootstrap.sh --role bao,apps,runner --restore bao-YYYY-MM-DD.snap`
+4. `sudo ./bootstrap.sh --role bao,apps --restore bao-YYYY-MM-DD.snap`
 5. Laptop: `bao-day` should just work. Re-issue the backup token with
    `bao-configure --backup-token --server you@newhost`.
 
@@ -191,11 +202,11 @@ Because the tunnel credentials moved with you, `bao.<DOMAIN>` and every tunnel-t
 automatically. Nothing else changes: laptop, workflows, other servers and DNS all stay the same.
 
 **If the tunnel credentials are lost**, skip the `cp`; bootstrap creates a new tunnel and repoints
-`bao.<DOMAIN>`. Then run `register-target <name> --mode tunnel --tunnel-id <new id>` and re-run each tunnel
+`bao.<DOMAIN>`. Then run `register-target <name> --mode tunnel --tunnel-id <new id> --ssh …` and re-run each tunnel
 app's deploy so its DNS follows.
 
 **Running apps after a move**: app containers aren't in the snapshot. Re-run each backend's deploy
-(Actions → deploy → Run workflow), and re-register the runners (`onboard-repo.sh … --runner-ssh`).
+(Actions → deploy → Run workflow). A rebuilt machine has a new SSH host key, so re-run `register-target` first.
 
 ### Rebuild a public app server
 
@@ -216,8 +227,11 @@ Do it once on a spare VM with a copy of the kit. It takes about 10 minutes and p
 - **GitHub Actions tokens** last 10 minutes. They only work for repos owned by `GH_OWNER` running on `main`,
   and can only read `kv/shared/*` and their own `kv/apps/<repo>/prod`. Keep anything more sensitive out of
   `kv/shared`.
-- **Self-hosted runners** have Docker access, so they're root-equivalent on that machine. Use them only for
-  private repos you control. `onboard-repo.sh` refuses public repos on tunnel targets.
+- **Deploy SSH** is user `deploy` (Docker access, so root-equivalent) and only accepts OpenBao certificates.
+  Only `main` of repos owned by `GH_OWNER` can get those certificates, valid for 10 minutes. On tunnel targets,
+  Cloudflare Access also requires the service token before SSH is even reachable.
+- **If you add a self-hosted runner** anyway, use it only for private repos. Pull requests from forks of a
+  public repo can run code on it.
 - **The OpenBao API is public** (CI needs it). Put Cloudflare Access on the `/ui` path, and add a WAF rate
   limit on `/v1/auth/`.
 - **Remote commands** in `register-target` and `bao-configure --server` use `sudo` over SSH, so they need

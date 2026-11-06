@@ -6,9 +6,9 @@
 #            plus a nightly snapshot cron job.
 #   apps     Caddy + an app area for backends deployed by the deploy-backend workflow.
 #            --mode tunnel  apps reached through this machine's Cloudflare Tunnel (no open ports;
-#                           deploys run on a self-hosted runner here)  [default]
+#                           GitHub deploys over SSH through the tunnel, behind Cloudflare Access)  [default]
 #            --mode public  apps on public :443 with the Cloudflare Origin cert (deploys over SSH)
-#   runner   Prepare a user for a self-hosted GitHub Actions runner (needed for apps in tunnel mode).
+#   runner   Optional: prepare a user for a self-hosted GitHub Actions runner (not needed for deploys).
 #
 # Usage (as root, from a clone of this repo with config.env filled in):
 #   ./bootstrap.sh --role bao,apps,runner                      # home server, fresh
@@ -140,15 +140,20 @@ if has_role apps; then
   install -d -m 755 "$STACK_DIR/caddy" "$STACK_DIR/caddy/sites" "$APPS_DIR"
   [[ -e "$STACK_DIR/caddy/sites/_empty.caddy" ]] || touch "$STACK_DIR/caddy/sites/_empty.caddy"
   cp "$TPL/Caddyfile" "$STACK_DIR/caddy/Caddyfile"
+  # Deploy user that GitHub Actions logs in as over SSH (OpenBao certificate auth only)
+  id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash -G docker deploy
+  # '*' = no password but not locked; sshd refuses even certificate logins for locked ('!') accounts
+  usermod -p '*' deploy
+  # App dirs are shared by the docker group (deploy, and gha if a runner is used)
+  chgrp -R docker "$APPS_DIR" "$STACK_DIR/caddy/sites"
+  chmod -R g+rwX "$APPS_DIR" "$STACK_DIR/caddy/sites"
+  find "$APPS_DIR" "$STACK_DIR/caddy/sites" -type d -exec chmod g+s {} +
+  ok "user 'deploy' (docker group) can write $APPS_DIR and caddy/sites"
   if [[ "$MODE" == tunnel ]]; then
     render "$TPL/compose.caddy-tunnel.yml" "$STACK_DIR/compose/caddy.yml" STACK_DIR
   else
     install -d -m 750 "$STACK_DIR/caddy/certs"
     render "$TPL/compose.caddy-public.yml" "$STACK_DIR/compose/caddy.yml" STACK_DIR
-    # Deploy user used by GitHub Actions over SSH (certificate auth only)
-    id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash -G docker deploy
-    chown deploy:deploy "$APPS_DIR" "$STACK_DIR/caddy/sites"
-    ok "user 'deploy' (docker group) owns $APPS_DIR and caddy/sites"
     # Oracle Cloud Ubuntu images reject everything but SSH in iptables
     if iptables -S INPUT 2>/dev/null | grep -q -- '-j REJECT' \
        && ! iptables -C INPUT -p tcp --dport 443 -m state --state NEW -j ACCEPT 2>/dev/null; then
@@ -202,6 +207,9 @@ if (( NEED_TUNNEL )); then
       echo "    service: http://openbao:8200"
     fi
     if has_role apps && [[ "$MODE" == tunnel ]]; then
+      # SSH for deploys; Cloudflare Access (service token) guards this hostname
+      echo "  - hostname: ssh-$TUNNEL_NAME.$DOMAIN"
+      echo "    service: ssh://host.docker.internal:22"
       echo "  - hostname: \"*.$DOMAIN\""
       echo "    service: http://caddy:80"
     fi
@@ -276,9 +284,7 @@ fi
 if has_role runner; then
   step "GitHub Actions runner user"
   id gha >/dev/null 2>&1 || useradd -m -s /bin/bash -G docker gha
-  install -d -o gha -g gha "$APPS_DIR"
-  [[ -d "$STACK_DIR/caddy/sites" ]] && chown -R gha:gha "$STACK_DIR/caddy/sites"
-  ok "user 'gha' (docker group) owns $APPS_DIR and caddy/sites"
+  ok "user 'gha' (docker group) shares $APPS_DIR and caddy/sites with deploy"
   if [[ -n "$RUNNER_URL" ]]; then
     [[ -n "$RUNNER_TOKEN" ]] || die "--runner-url needs --runner-token"
     NAME="$(hostname -s)-$(slug "${RUNNER_URL##*/}")"
@@ -314,6 +320,19 @@ else
   warn "OpenBao's SSH CA isn't reachable yet (normal on a brand-new install). Re-run this script after bin/bao-configure."
 fi
 
+# ---------------------------------------------------------------- SSH via tunnel
+if has_role apps && [[ "$MODE" == tunnel ]]; then
+  step "SSH through the tunnel"
+  if ss -Hltn 2>/dev/null | awk '{print $4}' | grep -Eq '^(0\.0\.0\.0|\*|\[::\]):22$'; then
+    ok "sshd listens on all interfaces (cloudflared reaches it via host.docker.internal)"
+  else
+    warn "sshd isn't listening on all interfaces on port 22 — cloudflared can't reach it. Check ListenAddress/Port in /etc/ssh/sshd_config"
+  fi
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    warn "ufw is active: allow SSH from Docker networks, e.g.  sudo ufw allow from 172.16.0.0/12 to any port 22 proto tcp"
+  fi
+fi
+
 # ---------------------------------------------------------------- next steps
 step "Next steps"
 if has_role bao && [[ -z "$RESTORE" ]] && [[ -f "$STACK_DIR/openbao/INIT-OUTPUT.txt" ]]; then
@@ -323,7 +342,8 @@ if has_role bao && [[ -z "$RESTORE" ]] && [[ -f "$STACK_DIR/openbao/INIT-OUTPUT.
 fi
 if has_role apps; then
   if [[ "$MODE" == tunnel ]]; then
-    echo "  • Laptop: bin/register-target $RUNNER_LABEL --mode tunnel --tunnel-id ${TUNNEL_ID:-<id>}"
+    echo "  • Laptop: bin/register-target $TUNNEL_NAME --mode tunnel --tunnel-id ${TUNNEL_ID:-<id>} --ssh $(logname 2>/dev/null || echo you)@$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "    (deploys SSH in through ssh-$TUNNEL_NAME.$DOMAIN — protect it with Cloudflare Access, see README)"
   else
     echo "  • Laptop: bin/register-target <name> --mode public --host $(curl -fsS -4 https://ifconfig.me 2>/dev/null || echo '<public-ip>')"
   fi
