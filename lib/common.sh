@@ -54,7 +54,8 @@ remote_sudo_install() {
   local host="$1" dest="$2" mode="$3" tmp
   tmp="/tmp/.infra-$$-$RANDOM"
   ssh "$host" "umask 077; cat > $tmp" || return 1
-  ssh -t "$host" "sudo install -D -m $mode $tmp $dest; rc=\$?; rm -f $tmp; exit \$rc"
+  # stdin is still the piped content here, so give ssh the real terminal for sudo's prompt
+  ssh -t "$host" "sudo install -D -m $mode $tmp $dest; rc=\$?; rm -f $tmp; exit \$rc" < /dev/tty
 }
 
 # Render a template with only the listed variables substituted (leaves other $ alone).
