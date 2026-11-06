@@ -89,6 +89,7 @@ install -d -m 755 "$STACK_DIR" "$STACK_DIR/compose"
 docker network inspect edge >/dev/null 2>&1 || docker network create edge >/dev/null
 ok "$STACK_DIR and docker network 'edge'"
 INCLUDES=()
+RESTART=()
 
 # ---------------------------------------------------------------- role: bao
 if has_role bao; then
@@ -120,7 +121,9 @@ if has_role bao; then
   KEY_ID=$(sha256sum "$KEY" | cut -c1-12)
   BAO_NODE_ID=$(hostname -s)
   export KEY_ID BAO_NODE_ID
+  BAO_CFG_BEFORE=$(sha256sum "$B/config/config.hcl" 2>/dev/null || true)
   render "$TPL/openbao.hcl" "$B/config/config.hcl" BAO_ADDR BAO_NODE_ID KEY_ID
+  [[ "$(sha256sum "$B/config/config.hcl")" == "$BAO_CFG_BEFORE" ]] || RESTART+=(openbao)
   render "$TPL/compose.openbao.yml" "$STACK_DIR/compose/openbao.yml" BAO_VERSION STACK_DIR
   INCLUDES+=(compose/openbao.yml)
   ok "config rendered (seal key id $KEY_ID)"
@@ -203,7 +206,9 @@ if (( NEED_TUNNEL )); then
       echo "    service: http://caddy:80"
     fi
     echo "  - service: http_status:404"
-  } > "$C/config.yml"
+  } > "$C/config.yml.new"
+  if ! cmp -s "$C/config.yml.new" "$C/config.yml"; then RESTART+=(cloudflared); fi
+  mv "$C/config.yml.new" "$C/config.yml"
   chown 65532:65532 "$C"/*
   chmod 640 "$C"/*.json
   render "$TPL/compose.cloudflared.yml" "$STACK_DIR/compose/cloudflared.yml" STACK_DIR
@@ -221,6 +226,11 @@ step "Starting the stack"
 } > "$STACK_DIR/compose.yml"
 if (( ${#INCLUDES[@]} )); then
   (cd "$STACK_DIR" && docker compose up -d --remove-orphans --quiet-pull)
+  # Config files are bind-mounted, so changes need a restart to take effect
+  if (( ${#RESTART[@]} )); then
+    (cd "$STACK_DIR" && docker compose restart "${RESTART[@]}" >/dev/null)
+    ok "restarted for config changes: ${RESTART[*]}"
+  fi
   ok "running: $(cd "$STACK_DIR" && docker compose ps --format '{{.Name}}' | paste -sd' ')"
 else
   ok "nothing to run for these roles"

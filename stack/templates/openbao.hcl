@@ -18,6 +18,18 @@ listener "tcp" {
   x_forwarded_for_authorized_addrs = "172.16.0.0/12"
 }
 
+# Audit log to stdout (docker logs openbao). OpenBao 2.2+ only allows audit
+# devices to be declared here, not enabled through the API.
+audit "file" "stdout" {
+  description = "Audit log to container stdout"
+  options {
+    file_path     = "stdout"
+    format        = "json"
+    hmac_accessor = "true"
+    log_raw       = "false"
+  }
+}
+
 # Auto-unseal from a 32-byte key file. The key never goes into backups.
 seal "static" {
   current_key_id = "${KEY_ID}"

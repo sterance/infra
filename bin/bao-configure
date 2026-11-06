@@ -50,9 +50,12 @@ if (( ONLY_BACKUP )); then issue_backup_token; exit 0; fi
 
 # ---------------------------------------------------------------- engines
 step "Engines"
-bao audit list -format=json 2>/dev/null | jq -e '."file/"' >/dev/null \
-  || bao audit enable file file_path=stdout >/dev/null
-ok "audit log → docker logs openbao"
+# Audit devices are declared in the server config (OpenBao 2.2+ refuses to enable them via the API)
+if bao audit list -format=json 2>/dev/null | jq -e 'length > 0' >/dev/null; then
+  ok "audit log → docker logs openbao"
+else
+  warn "no audit device yet — update the server (pull this repo, re-run bootstrap.sh); carrying on"
+fi
 MOUNTS=$(bao secrets list -format=json)
 jq -e '."kv/"'  >/dev/null <<<"$MOUNTS" || bao secrets enable -path=kv kv-v2 >/dev/null
 jq -e '."ssh/"' >/dev/null <<<"$MOUNTS" || bao secrets enable -path=ssh ssh >/dev/null
