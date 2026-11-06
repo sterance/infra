@@ -310,7 +310,9 @@ fi
 
 # ---------------------------------------------------------------- SSH CA trust
 step "SSH certificate authority"
-CA=$(curl -fsS "$BAO_ADDR/v1/ssh/public_key" 2>/dev/null || true)
+# On the OpenBao host, ask it directly (the tunnel may still be reconnecting after a restart)
+if has_role bao; then CA_URL=http://127.0.0.1:8200; else CA_URL=$BAO_ADDR; fi
+CA=$(curl -fsS --retry 5 --retry-delay 2 --retry-all-errors "$CA_URL/v1/ssh/public_key" 2>/dev/null || true)
 if [[ "$CA" == ssh-* ]]; then
   printf '%s\n' "$CA" > /etc/ssh/trusted-user-ca-keys.pem
   echo 'TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem' > /etc/ssh/sshd_config.d/10-openbao-ca.conf
