@@ -6,7 +6,7 @@
 set -euo pipefail
 CFG="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/config.env"
 if [[ -z "${SSH_PRINCIPALS:-}" && -f "$CFG" ]]; then
-  ADMINS=$(grep -E '^SSH_ADMIN_USERS=' "$CFG" | tail -1 | cut -d= -f2- | tr -d ' "'"'"'')
+  ADMINS=$(grep -E '^SSH_ADMIN_USERS=' "$CFG" | tail -1 | cut -d= -f2- | sed 's/#.*//' | tr -d ' "'"'"'')
   [[ -n "$ADMINS" ]] && SSH_PRINCIPALS="$ADMINS,deploy,gha"
 fi
 KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
