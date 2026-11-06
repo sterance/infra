@@ -129,7 +129,7 @@ bao kv put -mount=kv ssh/github private_key=@/tmp/gh public_key=@/tmp/gh.pub && 
 
 ### 1.6 Backups
 
-Add `/opt/stack/openbao/snapshots` to your Backblaze job. **Exclude** `/opt/stack/openbao/secrets` and
+Add `/opt/stack/openbao/snapshots` and any app data folders (`/opt/apps/*/data`) to your Backblaze job. **Exclude** `/opt/stack/openbao/secrets` and
 `/opt/stack/cloudflared`. Snapshots run at 02:30 (`/var/log/bao-snapshot.log`); schedule Backblaze after that.
 
 ---
@@ -148,7 +148,11 @@ It imports secrets into `kv/apps/<owner>/<repo>/{prod,dev}` and sets the `BAO_AD
 repo variables. It commits `.github/workflows/deploy.yml` (or opens a PR), and registers a runner for
 tunnel targets.
 
-- **Backends** need a `Dockerfile` whose app listens on `0.0.0.0:$PORT` (default 8080).
+- **Backends** need a `Dockerfile` whose app listens on `0.0.0.0:$PORT` (default 8080). Use `--dockerfile
+  server/Dockerfile` for one in a subfolder (the build context stays the repo root unless you pass `--context`),
+  `--port` for another port, and `--subdomain` to serve at a name other than `<repo>-backend`.
+- **Persistent data**: `--data-dir /app/data` keeps that container path in `/opt/apps/<repo>/data` on the
+  server across deploys. Add `/opt/apps/*/data` to your Backblaze job.
 - **Frontends** build with `npm ci && npm run build` into `dist/` unless you pass other options.
 - **Moving a backend** to another target is `gh variable set DEPLOY_TARGET -R owner/repo --body home`
   and a re-run; then `docker compose down` in `/opt/apps/<repo>` on the old server.

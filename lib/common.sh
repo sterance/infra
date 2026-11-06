@@ -22,6 +22,12 @@ slug() { tr '[:upper:]' '[:lower:]' <<<"$1" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+|-
 load_config() {
   local cfg="${INFRA_CONFIG:-$INFRA_ROOT/config.env}"
   [[ -f "$cfg" ]] || die "No config at $cfg — copy config.env.example to config.env and fill it in."
+  # Dry-load first: an unquoted value with a space (KEY=a, b) runs "b" as a command.
+  # shellcheck source=/dev/null
+  local cfg_err
+  if ! cfg_err=$(bash -ec 'source "$1"' _ "$cfg" 2>&1 >/dev/null); then
+    die "$cfg has an error (often a value with a space — write KEY=a,b or KEY=\"a b\"): ${cfg_err%%$'\n'*}"
+  fi
   set -a
   # shellcheck source=/dev/null
   source "$cfg"
@@ -37,7 +43,8 @@ load_config() {
   APPS_DIR="${APPS_DIR:-/opt/apps}"
   TUNNEL_NAME="${TUNNEL_NAME:-$(hostname -s)}"
   SNAPSHOT_KEEP_DAYS="${SNAPSHOT_KEEP_DAYS:-14}"
-  export INFRA_REPO BAO_VERSION STACK_DIR APPS_DIR TUNNEL_NAME SNAPSHOT_KEEP_DAYS
+  SSH_ADMIN_USERS="${SSH_ADMIN_USERS:-ubuntu}"; SSH_ADMIN_USERS="${SSH_ADMIN_USERS// /}"
+  export INFRA_REPO BAO_VERSION STACK_DIR APPS_DIR TUNNEL_NAME SNAPSHOT_KEEP_DAYS SSH_ADMIN_USERS
 }
 
 # Render a template with only the listed variables substituted (leaves other $ alone).

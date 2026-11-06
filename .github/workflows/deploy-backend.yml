@@ -10,7 +10,11 @@ on:
     inputs:
       bao_addr: { type: string, required: true }   # caller passes ${{ vars.BAO_ADDR }}
       target:   { type: string, required: true }   # caller passes ${{ vars.DEPLOY_TARGET }}
-      port:     { type: string, default: "8080" }  # port the app listens on ($PORT)
+      port:       { type: string, default: "8080" }       # port the app listens on ($PORT)
+      dockerfile: { type: string, default: "Dockerfile" } # path from the repo root
+      context:    { type: string, default: "." }          # docker build context
+      data_dir:   { type: string, default: "" }           # container path to persist, e.g. /app/data
+      subdomain:  { type: string, default: "" }           # default: <repo>-backend
 
 jobs:
   plan:
@@ -34,7 +38,8 @@ jobs:
 
   build:
     needs: plan
-    runs-on: ubuntu-latest
+    # arm64 images build natively on GitHub's ARM runners for public repos; private repos use QEMU emulation
+    runs-on: ${{ (needs.plan.outputs.platform == 'linux/arm64' && !github.event.repository.private) && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions: { contents: read, packages: write }
     outputs:
       image: ${{ steps.img.outputs.image }}
@@ -49,6 +54,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           push: true
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
           platforms: ${{ needs.plan.outputs.platform }}
           tags: ${{ steps.img.outputs.image }}
           cache-from: type=gha
@@ -85,7 +92,7 @@ jobs:
           bao_get() { curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" "$BAO_ADDR/v1/kv/data/$1"; }
           REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' \
                  | sed -E 's/[^a-z0-9-]+/-/g; s/^-+|-+$//g')
-          HOST="$REPO-backend.$DOMAIN"
+          SUB="${{ inputs.subdomain }}"; HOST="${SUB:-$REPO-backend}.$DOMAIN"
           echo "REPO=$REPO" >> "$GITHUB_ENV"; echo "HOST=$HOST" >> "$GITHUB_ENV"
 
           T=$(bao_get "shared/targets/${{ inputs.target }}")
@@ -118,6 +125,11 @@ jobs:
           networks:
             edge: { external: true }
           EOF
+          DATA_DIR="${{ inputs.data_dir }}"
+          if [ -n "$DATA_DIR" ]; then
+            # persisted at <apps_dir>/<repo>/data on the server; survives redeploys
+            sed -i "s#^    networks: \[edge\]#    volumes: [\"./data:$DATA_DIR\"]\n    networks: [edge]#" "$B/compose.yml"
+          fi
           if [ "$MODE" = tunnel ]; then
             printf 'http://%s {\n  reverse_proxy %s:%s\n}\n' "$HOST" "$REPO" "$PORT" > "$B/site.caddy"
           else

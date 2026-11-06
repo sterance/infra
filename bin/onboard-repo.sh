@@ -21,13 +21,16 @@ Options
   [owner/repo]            Repo to onboard (default: origin of the current git repo)
   --frontend | --backend  Pipeline type (required)
   Frontend:
-    --subdomain NAME      Default: repo name
+    --subdomain NAME      Default: repo name (backends: <repo>-backend)
     --output-dir DIR      Default (workflow): dist
     --build-cmd CMD       Default (workflow): "npm ci && npm run build"
     --node VERSION        Default (workflow): 22
   Backend:
     --target NAME         A target registered with bin/register-target (sets DEPLOY_TARGET)
     --port N              Container port (default 8080)
+    --dockerfile PATH     Dockerfile path from the repo root (default Dockerfile)
+    --context DIR         Docker build context (default .)
+    --data-dir PATH       Container path to persist across deploys, e.g. /app/data
     --runner-ssh U@HOST   Tunnel targets on personal accounts: register this repo's runner over SSH
   Secrets:
     --prod-env FILE       Import KEY=VALUE file into kv/apps/<owner>/<repo>/prod
@@ -42,6 +45,7 @@ EOF
 
 REPO_ARG="" ; KIND="" ; TARGET="" ; SUBDOMAIN="" ; OUTPUT_DIR="" ; BUILD_CMD=""
 NODE_VERSION="" ; PORT="" ; DEV_ENV="" ; PROD_ENV="" ; RUNNER_SSH="" ; USE_PR=0 ; DRY=0 ; YES=0 ; T_MODE=""
+DOCKERFILE="" ; CONTEXT="" ; DATA_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --frontend) KIND=frontend ;;
@@ -52,6 +56,9 @@ while [[ $# -gt 0 ]]; do
     --build-cmd) BUILD_CMD="$2"; shift ;;
     --node) NODE_VERSION="$2"; shift ;;
     --port) PORT="$2"; shift ;;
+    --dockerfile) DOCKERFILE="$2"; shift ;;
+    --context) CONTEXT="$2"; shift ;;
+    --data-dir) DATA_DIR="$2"; shift ;;
     --prod-env) PROD_ENV="$2"; shift ;;
     --dev-env) DEV_ENV="$2"; shift ;;
     --runner-ssh|--home-ssh) RUNNER_SSH="$2"; shift ;;
@@ -124,7 +131,7 @@ if [[ "$KIND" == backend ]]; then
     || die "Unknown target '$TARGET'. Registered: $(bao kv list -mount=kv -format=json shared/targets 2>/dev/null | jq -r 'join(", ")' || echo none)"
   T_MODE=$(jq -r .data.data.mode <<<"$T_JSON")
 else
-  [[ -z "$TARGET$PORT$RUNNER_SSH" ]] || die "--target/--port/--runner-ssh are backend-only"
+  [[ -z "$TARGET$PORT$RUNNER_SSH$DOCKERFILE$CONTEXT$DATA_DIR" ]] || die "--target/--port/--dockerfile/--context/--data-dir/--runner-ssh are backend-only"
 fi
 [[ -z "$PROD_ENV" || -f "$PROD_ENV" ]] || die "Not a file: $PROD_ENV"
 [[ -z "$DEV_ENV"  || -f "$DEV_ENV"  ]] || die "Not a file: $DEV_ENV"
@@ -152,7 +159,7 @@ fi
 gh repo view "$INFRA_REPO" >/dev/null 2>&1 || die "Infra repo '$INFRA_REPO' not found (INFRA_REPO in config.env)"
 
 if [[ "$KIND" == frontend ]]; then URL="https://${SUBDOMAIN:-$REPO_SLUG}.$DOMAIN"
-else URL="https://$REPO_SLUG-backend.$DOMAIN"; fi
+else URL="https://${SUBDOMAIN:-$REPO_SLUG-backend}.$DOMAIN"; fi
 
 cat <<EOF
 
@@ -270,7 +277,11 @@ if [[ "$KIND" == frontend ]]; then
   JOB=pages; WF=deploy-pages.yml; PERMS="{ contents: read, id-token: write }"
 else
   WITH+=('target: ${{ vars.DEPLOY_TARGET }}')
-  [[ -n "$PORT" ]] && WITH+=("port: \"$PORT\"")
+  [[ -n "$PORT"       ]] && WITH+=("port: \"$PORT\"")
+  [[ -n "$DOCKERFILE" ]] && WITH+=("dockerfile: \"$DOCKERFILE\"")
+  [[ -n "$CONTEXT"    ]] && WITH+=("context: \"$CONTEXT\"")
+  [[ -n "$DATA_DIR"   ]] && WITH+=("data_dir: \"$DATA_DIR\"")
+  [[ -n "$SUBDOMAIN"  ]] && WITH+=("subdomain: \"$SUBDOMAIN\"")
   JOB=backend; WF=deploy-backend.yml; PERMS="{ contents: read, packages: write, id-token: write }"
 fi
 
