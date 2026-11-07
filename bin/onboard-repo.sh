@@ -10,12 +10,13 @@
 #   bin/onboard-repo.sh jdoe/api --backend --target oracle --prod-env .env.prod --dev-env .env
 #   bin/onboard-repo.sh jdoe/worker --backend --target home --dockerfile server/Dockerfile --data-dir /app/data
 #   bin/onboard-repo.sh jdoe/api --backend --target oracle --pr --dry-run
+#   bin/onboard-repo.sh jdoe/api --backend --target oracle --gate-on-ci   # deploy from the repo's CI
 
 set -euo pipefail
 # shellcheck source=../lib/common.sh disable=SC2154
 source "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/../lib/common.sh"
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
 
 Options
   [owner/repo]            Repo to onboard (default: origin of the current git repo)
@@ -35,6 +36,9 @@ Options
     --prod-env FILE       Import KEY=VALUE file into kv/apps/<owner>/<repo>/prod
     --dev-env FILE        Import KEY=VALUE file into kv/apps/<owner>/<repo>/dev
   Behaviour:
+    --gate-on-ci          Deploy only after the repo's CI passes: deploy.yml is triggered by
+                          workflow_call (from a `deploy` job in the repo's CI) instead of pushes
+                          to main. Manual runs still deploy straight away. Prints the CI job to add.
     --pr                  Open a pull request instead of committing to the default branch
     -n, --dry-run         Show what would happen, change nothing
     -y, --yes             Don't ask for confirmation
@@ -44,7 +48,7 @@ EOF
 
 REPO_ARG="" ; KIND="" ; TARGET="" ; SUBDOMAIN="" ; OUTPUT_DIR="" ; BUILD_CMD=""
 NODE_VERSION="" ; PORT="" ; DEV_ENV="" ; PROD_ENV="" ; USE_PR=0 ; DRY=0 ; YES=0 ; T_MODE=""
-DOCKERFILE="" ; CONTEXT="" ; DATA_DIR=""
+DOCKERFILE="" ; CONTEXT="" ; DATA_DIR="" ; GATE_ON_CI=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --frontend) KIND=frontend ;;
@@ -61,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --prod-env) PROD_ENV="$2"; shift ;;
     --dev-env) DEV_ENV="$2"; shift ;;
     --runner-ssh|--home-ssh) warn "$1 is no longer needed: all targets deploy over SSH from GitHub's runners"; shift ;;
+    --gate-on-ci) GATE_ON_CI=1 ;;
     --pr) USE_PR=1 ;;
     -n|--dry-run) DRY=1 ;;
     -y|--yes) YES=1 ;;
@@ -166,6 +171,7 @@ cat <<EOF
   URL          $URL
   Secrets      kv/apps/$FULL/{prod,dev}
   Workflows    $INFRA_REPO
+  Trigger      $([[ $GATE_ON_CI == 1 ]] && echo "the repo's CI (workflow_call), after checks pass" || echo "push to main")
   Commit mode  $([[ $USE_PR == 1 ]] && echo "pull request" || echo "direct to $BRANCH")$([[ $DRY == 1 ]] && echo "  (DRY RUN)")
 EOF
 if (( ! YES && ! DRY )); then
@@ -239,11 +245,21 @@ else
   JOB=backend; WF=deploy-backend.yml; PERMS="{ contents: read, packages: write, id-token: write }"
 fi
 
+if (( GATE_ON_CI )); then
+  TRIGGER="# Pushes to main reach this through ci.yml's deploy job, after CI passes.
+# A manual run deploys straight away, without waiting for CI.
+on:
+  workflow_call:
+  workflow_dispatch:"
+else
+  TRIGGER="on:
+  push: { branches: [main] }
+  workflow_dispatch:"
+fi
+
 CALLER="# Managed by onboard-repo.sh — pipeline logic lives in $INFRA_REPO
 name: deploy
-on:
-  push: { branches: [main] }
-  workflow_dispatch:
+$TRIGGER
 permissions: $PERMS
 jobs:
   $JOB:
@@ -254,6 +270,29 @@ CALLER+=$'\n'
 
 printf '%s' "$CALLER" | sed 's/^/  │ /'
 WF_PATH=.github/workflows/deploy.yml
+
+# With --gate-on-ci nothing deploys on push until the repo's CI calls deploy.yml.
+CI_SNIPPET="  deploy:
+    needs: [<your check jobs>]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./$WF_PATH
+    permissions: $PERMS
+    secrets: inherit"
+CI_CALLS_DEPLOY=0
+if (( GATE_ON_CI )); then
+  for f in $(gh api "repos/$FULL/contents/.github/workflows?ref=$BRANCH" \
+               --jq '.[] | select(.type == "file") | .path' 2>/dev/null || true); do
+    [[ "$f" == "$WF_PATH" ]] && continue
+    if gh api "repos/$FULL/contents/$f?ref=$BRANCH" --jq .content 2>/dev/null | base64 -d 2>/dev/null \
+         | grep -Eq "uses:[[:space:]]*['\"]?\./$WF_PATH"; then
+      ok "$f calls $WF_PATH"; CI_CALLS_DEPLOY=1
+    fi
+  done
+  if (( ! CI_CALLS_DEPLOY )); then
+    warn "No workflow on $BRANCH calls $WF_PATH yet, so pushes to main won't deploy. Add this job to the repo's CI:"
+    printf '%s\n' "$CI_SNIPPET" | sed 's/^/  │ /'
+  fi
+fi
 if (( USE_PR )); then
   PR_BRANCH="onboard/deploy-pipeline"
   BASE_SHA=$(gh api "repos/$FULL/git/ref/heads/$BRANCH" --jq .object.sha)
@@ -266,12 +305,18 @@ if (( USE_PR )); then
   else
     run gh pr create -R "$FULL" --base "$BRANCH" --head "$PR_BRANCH" \
       --title "Onboard to deploy pipeline" \
-      --body "Adds the caller workflow for \`$INFRA_REPO/$WF\`. Merging to \`main\` deploys to $URL." >/dev/null
-    ok "opened pull request — merging it triggers the first deploy"
+      --body "Adds the caller workflow for \`$INFRA_REPO/$WF\`. $(if (( GATE_ON_CI )); then
+                echo "Deploys to $URL run from the repo's CI after its checks pass on \`main\`, or manually from Actions → deploy."
+              else echo "Merging to \`main\` deploys to $URL."; fi)" >/dev/null
+    if (( GATE_ON_CI )); then ok "opened pull request"
+    else ok "opened pull request — merging it triggers the first deploy"; fi
   fi
 else
   gh_put_file "$FULL" "$BRANCH" "$WF_PATH" "$CALLER" "ci: onboard to deploy pipeline"
-  if [[ "$BRANCH" == main ]]; then ok "this commit to main triggers the first deploy"; fi
+  if (( GATE_ON_CI )); then
+    if (( CI_CALLS_DEPLOY )); then ok "the next CI run on main that passes deploys"
+    else warn "nothing deploys on push until the repo's CI has the deploy job above (Actions → deploy → Run workflow deploys now)"; fi
+  elif [[ "$BRANCH" == main ]]; then ok "this commit to main triggers the first deploy"; fi
 fi
 
 # ---------------------------------------------------------------- done

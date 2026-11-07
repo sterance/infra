@@ -2,7 +2,7 @@
 # bin/onboard-repo.sh writes this for you and sets the BAO_ADDR and DEPLOY_TARGET repo variables.
 name: deploy
 on:
-  push: { branches: [main] }
+  push: { branches: [main] }   # with --gate-on-ci: `workflow_call:` instead, called from the repo's CI
   workflow_dispatch:
 permissions: { contents: read, packages: write, id-token: write }
 jobs:

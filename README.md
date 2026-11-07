@@ -154,6 +154,7 @@ cd ~/code/my-site && onboard-repo.sh --frontend
 onboard-repo.sh jdoe/api --backend --target oracle --prod-env .env.prod --dev-env .env
 onboard-repo.sh jdoe/worker --backend --target home --dockerfile server/Dockerfile --data-dir /app/data
 onboard-repo.sh jdoe/api --backend --target oracle --pr --dry-run   # preview, then open a PR
+onboard-repo.sh jdoe/api --backend --target oracle --gate-on-ci     # deploy only after the repo's CI passes
 ```
 
 It imports secrets into `kv/apps/<owner>/<repo>/{prod,dev}` and sets the `BAO_ADDR` and `DEPLOY_TARGET`
@@ -165,6 +166,22 @@ repo variables, and commits `.github/workflows/deploy.yml` (or opens a PR).
 - **Persistent data**: `--data-dir /app/data` keeps that container path in `/opt/apps/<repo>/data` on the
   server across deploys. Add `/opt/apps/*/data` to your Backblaze job.
 - **Frontends** build with `npm ci && npm run build` into `dist/` unless you pass other options.
+- **Gating deploys behind CI**: by default `deploy.yml` runs on every push to `main`, even one that fails
+  the repo's tests. With `--gate-on-ci` it is triggered by `workflow_call` instead, and the repo's own CI
+  calls it as its last job (the script checks for this and prints the job if it's missing):
+  ```yaml
+    deploy:
+      needs: [test, lint]          # the CI jobs that must pass first
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: ./.github/workflows/deploy.yml
+      permissions: { contents: read, packages: write, id-token: write }   # frontends: { contents: read, id-token: write }
+      secrets: inherit
+  ```
+  Without that job, pushes stop deploying. A push that fails CI shows `deploy` as skipped. **Actions → deploy →
+  Run workflow** still deploys straight away without CI, for redeploys and rollbacks. The OpenBao `deploy` role
+  only binds `repository_owner` and `ref`, so the extra level of nesting (`ci.yml` → `deploy.yml` →
+  `deploy-backend.yml`) authenticates the same way. Pass `--gate-on-ci` on every re-run, or the trigger
+  reverts to push.
 - **Moving a backend** to another target is `gh variable set DEPLOY_TARGET -R owner/repo --body home`
   and a re-run; then `docker compose down` in `/opt/apps/<repo>` on the old server.
 

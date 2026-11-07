@@ -5,3 +5,4 @@ config.env
 *.snap
 *.json.secret
 INIT-OUTPUT*.txt
+/docs
