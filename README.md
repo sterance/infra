@@ -164,7 +164,13 @@ repo variables, and commits `.github/workflows/deploy.yml` (or opens a PR).
   server/Dockerfile` for one in a subfolder (the build context stays the repo root unless you pass `--context`),
   `--port` for another port, and `--subdomain` to serve at a name other than `<repo>-backend`.
 - **Persistent data**: `--data-dir /app/data` keeps that container path in `/opt/apps/<repo>/data` on the
-  server across deploys. Add `/opt/apps/*/data` to your Backblaze job.
+  server across deploys. Add `/opt/apps/*/data` to your Backblaze job. **A rollback (below) reuses the same
+  data directory**: if the new image changed the data (a database migration, say), the old image starts
+  against the changed data. Infra can't undo that, so keep data changes backward compatible for one release,
+  or take your own backup before migrating.
+- **Health checks and rollback**: give every backend a cheap, unauthenticated health endpoint and pass
+  `--health-path /api/health` (also `--health-timeout SECS`, default 90, and `--health-stable SECS`, default 10).
+  See [Backend health checks](#backend-health-checks-and-rollback).
 - **Frontends** build with `npm ci && npm run build` into `dist/` unless you pass other options.
 - **Gating deploys behind CI**: by default `deploy.yml` runs on every push to `main`, even one that fails
   the repo's tests. With `--gate-on-ci` it is triggered by `workflow_call` instead, and the repo's own CI
@@ -184,6 +190,55 @@ repo variables, and commits `.github/workflows/deploy.yml` (or opens a PR).
   reverts to push.
 - **Moving a backend** to another target is `gh variable set DEPLOY_TARGET -R owner/repo --body home`
   and a re-run; then `docker compose down` in `/opt/apps/<repo>` on the old server.
+
+### Backend health checks and rollback
+
+`docker compose up -d` returns as soon as the container exists, so on its own a container that crashes on
+startup would look like a successful deploy. `deploy-backend.yml` therefore runs one script on the target that
+pulls the image, saves the live `compose.yml`, `app.env` and Caddy site file as `*.prev` in `/opt/apps/<repo>`,
+starts the new image, and polls every 2 seconds for up to `health_timeout` seconds. The new container is
+**healthy** when all of these hold at the same time:
+
+- its status is `running` (not `restarting`), and its restart count hasn't gone up since the wait began
+  (a single restart fails the check straight away);
+- it has been up for at least `health_stable` seconds, so a crash a few seconds after starting is caught;
+- with `health_path` set, `GET http://<repo>:<port><health_path>` returns 2xx. The request goes from a
+  throwaway `curlimages/curl` container on the `edge` network, so app images don't need `curl`.
+
+Without `health_path` only the first two are checked: a running app that answers 500 still passes.
+
+**If it's healthy**, the site file is installed, Caddy reloads, and older local tags of
+`ghcr.io/<owner>/<repo>` are removed except the new image and the one it replaced (kept for rollbacks).
+
+**If it isn't**, the job prints the container's state (status, exit code, restart count, error) and
+`docker logs --tail 100`, then:
+
+| Situation | What happens | Summary says |
+| --- | --- | --- |
+| A previous deployment exists | Restores `compose.yml.prev`/`app.env.prev`, starts it and runs the same health check on it. Caddy keeps the old site file. | "failed and was rolled back", with the rollback's health |
+| First deploy on this target | Stops the container so it doesn't restart-loop; its files become `compose.yml.failed`/`app.env.failed` | "First deploy … failed" |
+| Image or probe can't be pulled | Nothing is changed | "aborted before anything changed" |
+
+The job **fails in every one of these cases, even when the rollback is healthy**: the deploy itself didn't
+work. The step summary has the reason and the last 30 log lines (with `app.env` values blanked out); the full
+100 lines are in the "Deploy over SSH" step log. Typical reasons:
+
+- `restarted N time(s) during the health wait (crash loop)`: the app exits on startup or soon after. The logs say why.
+- `not healthy within 90s: GET … -> HTTP 404` (or `500`, or `000` for no answer): it runs, but the health
+  endpoint is wrong, failing, or the app isn't listening on `0.0.0.0:$PORT`.
+- `not healthy within 90s: up 4s, needs 10s without a restart`: it's slow to start; raise `health_timeout`.
+
+A rollback's health check uses the same `health_path`, so the first time you add one, an old image without
+that endpoint will be reported as an unhealthy rollback even though it is serving. That case is the
+exception; normally both images have the endpoint.
+
+After the deploy, a public smoke test requests `https://<host>/` from GitHub's runner. It only **warns**:
+Cloudflare Access or WAF rules can block GitHub, so the on-server check decides the result. Deploys of the
+same repo to the same target queue one after another (a `concurrency` group), so their rollback bookkeeping
+never interleaves; if several are queued, GitHub keeps only the newest waiting one.
+
+To roll back by hand on the server: `cd /opt/apps/<repo> && cp compose.yml.prev compose.yml && cp app.env.prev
+app.env && docker compose up -d`. Usually it's easier to re-run an older successful deploy from Actions.
 
 ## 3. Day to day
 

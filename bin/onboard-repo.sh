@@ -11,12 +11,13 @@
 #   bin/onboard-repo.sh jdoe/worker --backend --target home --dockerfile server/Dockerfile --data-dir /app/data
 #   bin/onboard-repo.sh jdoe/api --backend --target oracle --pr --dry-run
 #   bin/onboard-repo.sh jdoe/api --backend --target oracle --gate-on-ci   # deploy from the repo's CI
+#   bin/onboard-repo.sh jdoe/api --backend --target oracle --health-path /api/health
 
 set -euo pipefail
 # shellcheck source=../lib/common.sh disable=SC2154
 source "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/../lib/common.sh"
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; cat <<'EOF'
 
 Options
   [owner/repo]            Repo to onboard (default: origin of the current git repo)
@@ -32,6 +33,10 @@ Options
     --dockerfile PATH     Dockerfile path from the repo root (default Dockerfile)
     --context DIR         Docker build context (default .)
     --data-dir PATH       Container path to persist across deploys, e.g. /app/data
+    --health-path PATH    HTTP path that must return 2xx before a deploy counts, e.g. /api/health
+                          (recommended; without it only container state is checked)
+    --health-timeout SECS Seconds to wait for the new container to be healthy (workflow default 90)
+    --health-stable SECS  Seconds it must stay up with no restarts (workflow default 10)
   Secrets:
     --prod-env FILE       Import KEY=VALUE file into kv/apps/<owner>/<repo>/prod
     --dev-env FILE        Import KEY=VALUE file into kv/apps/<owner>/<repo>/dev
@@ -49,6 +54,7 @@ EOF
 REPO_ARG="" ; KIND="" ; TARGET="" ; SUBDOMAIN="" ; OUTPUT_DIR="" ; BUILD_CMD=""
 NODE_VERSION="" ; PORT="" ; DEV_ENV="" ; PROD_ENV="" ; USE_PR=0 ; DRY=0 ; YES=0 ; T_MODE=""
 DOCKERFILE="" ; CONTEXT="" ; DATA_DIR="" ; GATE_ON_CI=0
+HEALTH_PATH="" ; HEALTH_TIMEOUT="" ; HEALTH_STABLE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --frontend) KIND=frontend ;;
@@ -62,6 +68,9 @@ while [[ $# -gt 0 ]]; do
     --dockerfile) DOCKERFILE="$2"; shift ;;
     --context) CONTEXT="$2"; shift ;;
     --data-dir) DATA_DIR="$2"; shift ;;
+    --health-path) HEALTH_PATH="$2"; shift ;;
+    --health-timeout) HEALTH_TIMEOUT="$2"; shift ;;
+    --health-stable) HEALTH_STABLE="$2"; shift ;;
     --prod-env) PROD_ENV="$2"; shift ;;
     --dev-env) DEV_ENV="$2"; shift ;;
     --runner-ssh|--home-ssh) warn "$1 is no longer needed: all targets deploy over SSH from GitHub's runners"; shift ;;
@@ -133,8 +142,13 @@ if [[ "$KIND" == backend ]]; then
   T_JSON=$(bao kv get -mount=kv -format=json "shared/targets/$TARGET" 2>/dev/null) \
     || die "Unknown target '$TARGET'. Registered: $(bao kv list -mount=kv -format=json shared/targets 2>/dev/null | jq -r 'join(", ")' || echo none)"
   T_MODE=$(jq -r .data.data.mode <<<"$T_JSON")
+  [[ -z "$HEALTH_PATH" || "$HEALTH_PATH" == /* ]] || die "--health-path must start with / (got '$HEALTH_PATH')"
+  [[ -z "$HEALTH_TIMEOUT" || "$HEALTH_TIMEOUT" =~ ^[0-9]+$ ]] || die "--health-timeout must be whole seconds"
+  [[ -z "$HEALTH_STABLE"  || "$HEALTH_STABLE"  =~ ^[0-9]+$ ]] || die "--health-stable must be whole seconds"
+  (( ${HEALTH_TIMEOUT:-90} > ${HEALTH_STABLE:-10} )) || die "--health-timeout must be longer than --health-stable"
 else
-  [[ -z "$TARGET$PORT$DOCKERFILE$CONTEXT$DATA_DIR" ]] || die "--target/--port/--dockerfile/--context/--data-dir are backend-only"
+  [[ -z "$TARGET$PORT$DOCKERFILE$CONTEXT$DATA_DIR$HEALTH_PATH$HEALTH_TIMEOUT$HEALTH_STABLE" ]] \
+    || die "--target/--port/--dockerfile/--context/--data-dir/--health-* are backend-only"
 fi
 [[ -z "$PROD_ENV" || -f "$PROD_ENV" ]] || die "Not a file: $PROD_ENV"
 [[ -z "$DEV_ENV"  || -f "$DEV_ENV"  ]] || die "Not a file: $DEV_ENV"
@@ -242,6 +256,9 @@ else
   [[ -n "$CONTEXT"    ]] && WITH+=("context: \"$CONTEXT\"")
   [[ -n "$DATA_DIR"   ]] && WITH+=("data_dir: \"$DATA_DIR\"")
   [[ -n "$SUBDOMAIN"  ]] && WITH+=("subdomain: \"$SUBDOMAIN\"")
+  [[ -n "$HEALTH_PATH"    ]] && WITH+=("health_path: \"$HEALTH_PATH\"")
+  [[ -n "$HEALTH_TIMEOUT" ]] && WITH+=("health_timeout: \"$HEALTH_TIMEOUT\"")
+  [[ -n "$HEALTH_STABLE"  ]] && WITH+=("health_stable: \"$HEALTH_STABLE\"")
   JOB=backend; WF=deploy-backend.yml; PERMS="{ contents: read, packages: write, id-token: write }"
 fi
 

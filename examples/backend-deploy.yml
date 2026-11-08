@@ -12,3 +12,7 @@ jobs:
       bao_addr: ${{ vars.BAO_ADDR }}
       target: ${{ vars.DEPLOY_TARGET }}     # a name registered with bin/register-target
       # port: "3000"                        # default 8080
+      # health_path: "/api/health"          # must return 2xx on the edge network before the deploy counts;
+      #                                     # default "" = container-state checks only (recommended to set)
+      # health_timeout: "90"                # seconds to wait for the new container to be healthy
+      # health_stable: "10"                 # seconds it must stay up with no restarts
