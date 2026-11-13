@@ -51,7 +51,7 @@ jobs:
             echo "$k=$v" >> "$GITHUB_ENV"
           done
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "${{ inputs.node_version }}" }
 
       - name: Build
