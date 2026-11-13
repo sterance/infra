@@ -1,0 +1,21 @@
+# Managed by infra: generated from .github/updates.yml by the weekly dependency
+# check. Edit .github/updates.yml (its `dependabot:` section) instead: changes
+# made here are replaced by the next sync PR (branch updates/dependabot-config).
+#
+# Ecosystems are detected from the repository's files. The schedule and the
+# grouping (minor and patch updates in one PR per ecosystem) are infra's
+# updates/defaults.yml. The docker ecosystem is never added automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Australia/Melbourne
+    groups:
+      github-actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

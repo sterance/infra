@@ -57,7 +57,8 @@ load_config
 RUNNER_LABEL="${RUNNER_LABEL:-$TUNNEL_NAME}"
 NEED_TUNNEL=0
 if has_role bao || { has_role apps && [[ "$MODE" == tunnel ]]; }; then NEED_TUNNEL=1; fi
-CF_IMAGE=cloudflare/cloudflared:latest
+load_pins
+CF_IMAGE="cloudflare/cloudflared:$CLOUDFLARED_VERSION"
 BAO_IMAGE="quay.io/openbao/openbao:$BAO_VERSION"
 
 cat <<EOF
@@ -219,7 +220,7 @@ if (( NEED_TUNNEL )); then
   mv "$C/config.yml.new" "$C/config.yml"
   chown 65532:65532 "$C"/*
   chmod 640 "$C"/*.json
-  render "$TPL/compose.cloudflared.yml" "$STACK_DIR/compose/cloudflared.yml" STACK_DIR
+  render "$TPL/compose.cloudflared.yml" "$STACK_DIR/compose/cloudflared.yml" STACK_DIR CLOUDFLARED_VERSION
   INCLUDES+=(compose/cloudflared.yml)
   ok "tunnel $TUNNEL_ID configured"
 fi

@@ -1,0 +1,20 @@
+# The one schedule every repo onboarded with `onboard-repo.sh --updates` uses.
+# Changing it changes every repo: their generated .github/dependabot.yml gets a
+# sync PR on the next weekly run, and their caller workflow on the next
+# onboard-repo.sh run.
+
+# Dependabot's schedule (it understands time zones).
+schedule:
+  interval: weekly
+  day: monday
+  time: "09:00"
+  timezone: Australia/Melbourne
+
+# Minor and patch updates are grouped into one Dependabot PR per ecosystem;
+# majors get their own.
+group_update_types: [minor, patch]
+
+# The dependency-updates caller's schedule. GitHub's cron is UTC: Sunday 22:00
+# UTC is Monday 09:00 in Melbourne during daylight saving (08:00 in winter),
+# the same morning as Dependabot.
+workflow_cron: "0 22 * * 0"

@@ -25,12 +25,14 @@ run `bootstrap.sh`.
 | `config.env.example` | Copy to `config.env` (git-ignored): domain, GitHub owner, versions, paths |
 | `bootstrap.sh` | Sets up or rebuilds a server by role: `bao`, `apps` (and optionally `runner`) |
 | `stack/templates/` | Compose, OpenBao, Caddy and snapshot templates that `bootstrap.sh` renders |
-| `.github/workflows/` | Reusable `deploy-pages.yml` and `deploy-backend.yml` that app repos call |
+| `.github/workflows/` | Reusable `deploy-pages.yml`, `deploy-backend.yml` and `dependency-updates.yml` that app repos call |
+| `pins.env` | Versions infra pins (cloudflared + its SHA-256, the health-check probe image), kept current by its own weekly dependency check |
+| `updates/` | The dependency update engine, its shared schedule (`defaults.yml`) and its [README](updates/README.md) |
 | `bin/bao-configure` | Applies the OpenBao config: engines, SSH CA, policies, JWT auth, your login |
 | `bin/register-target` | Registers a deploy target (a server) in OpenBao |
 | `bin/onboard-repo.sh` | Wires an app repo into the pipeline |
 | `bin/bao-day`, `bao-run`, `bao-ssh-cert` | Daily laptop helpers |
-| `examples/` | What the generated caller workflows look like |
+| `examples/` | What the generated caller workflows look like, and an `updates.yml` with every check type |
 
 ## Concepts
 
@@ -188,6 +190,10 @@ repo variables, and commits `.github/workflows/deploy.yml` (or opens a PR).
   only binds `repository_owner` and `ref`, so the extra level of nesting (`ci.yml` → `deploy.yml` →
   `deploy-backend.yml`) authenticates the same way. Pass `--gate-on-ci` on every re-run, or the trigger
   reverts to push.
+- **Dependency updates**: `--updates` (with `--frontend`/`--backend`, or alone for a repo that doesn't
+  deploy) adds the weekly dependency check: Dependabot plus infra's own checks of what the repo describes in
+  `.github/updates.yml`, as PRs opened by a GitHub App whose key lives in OpenBao. No per-repo secrets.
+  One-time setup and the config format: [updates/README.md](updates/README.md).
 - **Moving a backend** to another target is `gh variable set DEPLOY_TARGET -R owner/repo --body home`
   and a re-run; then `docker compose down` in `/opt/apps/<repo>` on the old server.
 
@@ -258,7 +264,15 @@ app.env && docker compose up -d`. Usually it's easier to re-run an older success
 | Change a secret | `bao kv patch -mount=kv apps/<owner>/<repo>/prod KEY=value`, then re-run the deploy |
 | SSH to a server | `ssh ubuntu@<host>` (uses the cert from `bao-day`) |
 | List targets | `register-target --list` |
-| Upgrade OpenBao | bump `BAO_VERSION` in `config.env`, `git pull`, `sudo ./bootstrap.sh --role …` |
+| Upgrade OpenBao | bump `BAO_VERSION` in `config.env`, `git pull`, `sudo ./bootstrap.sh --role …` (the weekly check opens a PR for `config.env.example` when there's a new release) |
+| Upgrade cloudflared | merge the weekly check's PR to `pins.env`; deploys use it at once, servers on their next `bootstrap.sh` run |
+
+**What infra pins, and how it's kept current** (infra's own `.github/updates.yml`, run weekly by
+`dependency-updates-caller.yml`): GitHub Actions are pinned (third-party ones by commit SHA) and updated by
+the generated `.github/dependabot.yml`. OpenBao (`BAO_VERSION`), cloudflared (`pins.env`: version and the
+binary's SHA-256) and the probe image (`pins.env`) get PRs from infra's checks. `caddy:2` deliberately
+floats on its major: patch and minor releases arrive when `bootstrap.sh` pulls again. `deploy-backend.yml`
+reads `pins.env` from infra at its `infra_ref` input (default `main`).
 
 ---
 
@@ -308,6 +322,10 @@ Do it once on a spare VM with a copy of the kit. It takes about 10 minutes and p
 - **GitHub Actions tokens** last 10 minutes. They only work for repos owned by `GH_OWNER` running on `main`,
   and can only read `kv/shared/*` and their own `kv/apps/<repo>/prod`. Keep anything more sensitive out of
   `kv/shared`.
+- **The dependency updates app's key** is at `kv/updates/github-app`, outside `kv/shared/`. Only role
+  `updates` can read it, and that role is bound to infra's own `dependency-updates.yml` on `main`
+  (`job_workflow_ref`), for a repo's `main`, with the audience set to `BAO_ADDR`. The jobs that run a repo's
+  code have no OpenBao access. See [updates/README.md](updates/README.md#2-who-can-read-the-key).
 - **Deploy SSH** is user `deploy` (Docker access, so root-equivalent) and only accepts OpenBao certificates.
   Only `main` of repos owned by `GH_OWNER` can get those certificates, valid for 10 minutes. On tunnel targets,
   Cloudflare Access also requires the service token before SSH is even reachable.

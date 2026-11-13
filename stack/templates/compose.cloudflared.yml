@@ -1,7 +1,7 @@
 # Rendered by bootstrap.sh
 services:
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION}   # pins.env
     container_name: cloudflared
     command: tunnel --config /etc/cloudflared/config.yml run
     restart: unless-stopped

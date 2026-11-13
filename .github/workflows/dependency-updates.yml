@@ -1,0 +1,294 @@
+# Reusable: the weekly dependency check for any onboarded repo (onboard-repo.sh --updates).
+# The repo describes its pins in .github/updates.yml; see updates/README.md.
+#
+#   plan     validates .github/updates.yml and builds the matrix (plus the Dependabot sync)
+#   check    one job per check, with NO secrets and no OpenBao access: it may run the repo's own
+#            code (custom checks). It uploads result.json, body.md and changes.patch.
+#   collect  lists the checks that want a PR or an issue
+#   publish  infra-owned steps only (nothing from the caller repo runs here): applies the patch,
+#            logs in to OpenBao (role `updates`), mints an app token for this repo only, and opens
+#            or updates the PR on updates/<name>. Issues use the workflow's own token.
+#   report   one "Dependency update check failed" issue per repo
+#
+# Security: only `publish` has id-token: write, and its steps are fixed here. The OpenBao role
+# `updates` is bound to this file on infra's main (job_workflow_ref) and to the audience
+# bao_addr, so a JWT minted for another address is useless against the real OpenBao.
+name: dependency-updates
+on:
+  workflow_call:
+    inputs:
+      bao_addr:   { type: string, required: true }        # caller passes ${{ vars.BAO_ADDR }}
+      infra_repo: { type: string, default: "" }           # default: <owner>/infra
+      infra_ref:  { type: string, default: "main" }       # which infra the engine (plan, check) comes from
+      dry_run:    { type: boolean, default: false }       # run every check, show the diffs, open nothing
+      fail:       { type: string, default: "" }           # a check name to fail on purpose
+
+concurrency:
+  group: dependency-updates-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      config: ${{ steps.plan.outputs.config }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: repo, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.infra_repo || format('{0}/infra', github.repository_owner) }}
+          ref: ${{ inputs.infra_ref }}
+          path: infra
+          persist-credentials: false
+      - name: Validate .github/updates.yml
+        id: plan
+        env: { FAIL: "${{ inputs.fail }}" }
+        run: python3 infra/updates/cli.py plan --root repo --out "$RUNNER_TEMP/config.json" --fail "$FAIL"
+
+  check:
+    needs: plan
+    name: check ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # No id-token, no secrets: this job may run the repo's own code.
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      NAME: ${{ matrix.name }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: repo, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.infra_repo || format('{0}/infra', github.repository_owner) }}
+          ref: ${{ inputs.infra_ref }}
+          path: infra
+          persist-credentials: false
+
+      - name: Fail on purpose
+        if: inputs.fail == matrix.name
+        run: |
+          echo "::error::failing on purpose (the fail input)"
+          exit 1
+
+      - name: Check
+        env:
+          CONFIG: ${{ needs.plan.outputs.config }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          # Read-only, for the GitHub API's rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$CONFIG" > "$RUNNER_TEMP/config.json"
+          args=(check "$NAME" --root repo --config-json "$RUNNER_TEMP/config.json" --out "$RUNNER_TEMP/out")
+          [ "$DRY_RUN" = true ] && args+=(--dry-run)
+          python3 infra/updates/cli.py "${args[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: update-${{ matrix.name }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 7
+          if-no-files-found: error
+
+  collect:
+    needs: [plan, check]
+    if: always() && needs.plan.result == 'success' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      any: ${{ steps.list.outputs.any }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { pattern: update-*, path: results }
+      - name: Checks that want a PR or an issue
+        id: list
+        run: |
+          set -euo pipefail
+          # result.json comes from jobs that ran the repo's code: take only well-formed values.
+          m=$(for f in results/update-*/result.json; do
+                [ -f "$f" ] || continue
+                dir=$(basename "$(dirname "$f")"); name=${dir#update-}
+                jq -c --arg n "$name" 'select((.result == "pr" or .result == "issue") and .name == $n
+                                              and ($n | test("^[a-z0-9][a-z0-9-]{0,49}$")))
+                                       | {name: $n, result}' "$f" || true
+              done | jq -sc '{include: .}')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "any=$(jq '.include | length > 0' <<<"$m")" >> "$GITHUB_OUTPUT"
+          echo "To publish: $m"
+
+  publish:
+    needs: collect
+    if: needs.collect.outputs.any == 'true'
+    name: publish ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, issues: write, id-token: write }
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.collect.outputs.matrix) }}
+    env:
+      NAME: ${{ matrix.name }}
+      MARKER: "<!-- dependency-update:${{ matrix.name }} -->"
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: "update-${{ matrix.name }}", path: "${{ runner.temp }}/update" }
+
+      - name: Read the result
+        id: result
+        env: { U: "${{ runner.temp }}/update" }
+        run: |
+          set -euo pipefail
+          title=$(jq -r '.title // ""' "$U/result.json" | tr -d '\r\n' | cut -c1-200)
+          [ -n "$title" ] || { echo "::error::$NAME: no title"; exit 1; }
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          # Keep the hidden marker first (one PR or issue per check), and the body within GitHub's limit.
+          { echo "$MARKER"; grep -vF -- "$MARKER" "$U/body.md" | head -c 60000; } > "$U/body.final.md"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: matrix.result == 'pr'
+        with: { path: repo, persist-credentials: false }
+
+      # Before any credential exists: the patch may touch nothing under .github/workflows/
+      # (the app has no Workflows permission), nothing outside the tree, and no symlinks.
+      - name: Apply the patch
+        if: matrix.result == 'pr'
+        working-directory: repo
+        env: { PATCH: "${{ runner.temp }}/update/changes.patch" }
+        run: |
+          set -euo pipefail
+          [ -s "$PATCH" ] || { echo "::error::$NAME: no patch"; exit 1; }
+          paths=$(git apply --numstat -z "$PATCH" | tr '\0' '\n' | awk -F'\t' 'NF==3{print $3; next} NF>0{print}')
+          bad=0
+          while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            case "$p" in
+              .github/workflows/*|.git/*|/*|../*|*/../*) echo "::error::$NAME: the patch touches $p, which checks may not change"; bad=1 ;;
+            esac
+          done <<<"$paths"
+          if grep -Eq '^(new file mode|new mode|old mode|deleted file mode) 120000' "$PATCH"; then
+            echo "::error::$NAME: the patch adds or changes a symbolic link"; bad=1
+          fi
+          if grep -Eq '^(rename|copy) (from|to) \.github/workflows/' "$PATCH"; then
+            echo "::error::$NAME: the patch renames a workflow file"; bad=1
+          fi
+          [ "$bad" = 0 ] || exit 1
+          git apply --index "$PATCH"
+          git diff --cached --stat
+
+      - name: OpenBao login (role updates)
+        id: bao
+        if: matrix.result == 'pr'
+        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
+        with:
+          url: ${{ inputs.bao_addr }}
+          method: jwt
+          role: updates
+          # The audience is the address: a token minted for any other address won't log in here.
+          jwtGithubAudience: ${{ inputs.bao_addr }}
+          exportEnv: false
+          exportToken: false
+          secrets: |
+            kv/data/updates/github-app client_id   | client_id ;
+            kv/data/updates/github-app private_key | private_key
+
+      # PRs opened with GITHUB_TOKEN don't trigger CI; PRs opened as the app do.
+      - name: App token (this repository only)
+        id: app
+        if: matrix.result == 'pr'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.bao.outputs.client_id }}
+          private-key: ${{ steps.bao.outputs.private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Pull request
+        if: matrix.result == 'pr'
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          path: repo
+          token: ${{ steps.app.outputs.token }}
+          branch: updates/${{ matrix.name }}
+          delete-branch: true
+          sign-commits: true
+          title: ${{ steps.result.outputs.title }}
+          commit-message: ${{ steps.result.outputs.title }}
+          body-path: ${{ runner.temp }}/update/body.final.md
+
+      # An issue doesn't need to trigger CI, so the workflow's own token opens it and the app
+      # keeps only Contents and Pull requests.
+      - name: Issue
+        if: matrix.result == 'issue'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.result.outputs.title }}
+          BODY: ${{ runner.temp }}/update/body.final.md
+        run: |
+          set -euo pipefail
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,body \
+            --jq "[.[] | select(.body | contains(env.MARKER))][0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY"
+            echo "Updated issue #$number"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY"
+          fi
+
+  report:
+    needs: [plan, check, collect, publish]
+    if: always() && !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions: { issues: write, actions: read }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # publish is skipped when nothing needs publishing; that isn't a failure or a gap.
+      RESULTS: >-
+        ${{ needs.plan.result }} ${{ needs.check.result }} ${{ needs.collect.result }}
+        ${{ needs.collect.outputs.any == 'true' && needs.publish.result || 'success' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      MARKER: "<!-- dependency-update:failure -->"
+    steps:
+      - name: Open, update or close the failure issue
+        run: |
+          set -euo pipefail
+          title="Dependency update check failed"
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,body \
+            --jq "[.[] | select(.body | contains(env.MARKER))][0].number // empty")
+          echo "Results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*)
+              failed=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+                --paginate --jq '.jobs[] | select(.conclusion == "failure") | "- " + .name')
+              body=$(printf '%s\n' \
+                "$MARKER" \
+                "The weekly dependency check failed in [run $GITHUB_RUN_ID]($RUN_URL) ($(date -u +%Y-%m-%d))." \
+                "" "Failed jobs:" "" "$failed" "" \
+                "Each failed job's log says why (an invalid \`.github/updates.yml\`, an API that didn't answer, a pin that moved, a hash that didn't match, no OpenBao access). Fix it, then re-run the workflow (Actions → Dependency updates → Run workflow); this issue closes when everything succeeds." \
+                "" "Setup and troubleshooting: infra's updates/README.md.")
+              if [ -n "$number" ]; then
+                gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+                gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "Failed again: $RUN_URL"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              ;;
+            *" cancelled "*|*" skipped "*)
+              echo "Some jobs didn't run; leaving the issue as it is."
+              ;;
+            *)
+              if [ -n "$number" ]; then
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "Every check succeeded in $RUN_URL."
+              fi
+              ;;
+          esac

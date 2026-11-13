@@ -1,0 +1,51 @@
+# What infra itself pins, for its own weekly dependency check
+# (.github/workflows/dependency-updates-caller.yml calls the same reusable
+# workflow every onboarded repo does). See updates/README.md.
+#
+# GitHub Actions are covered by the generated .github/dependabot.yml.
+# caddy:2 in stack/templates/ floats on its major on purpose: patch and minor
+# releases arrive when bootstrap.sh pulls again.
+version: 1
+
+checks:
+  - name: openbao
+    type: github-release
+    repo: openbao/openbao
+    edits:
+      - file: config.env.example
+        pattern: '^BAO_VERSION=(?P<version>\d+\.\d+\.\d+)$'
+        docker_image: quay.io/openbao/openbao
+    notes: |
+      Merging this changes only the example. Each server reads `BAO_VERSION` from
+      its own `config.env` (git-ignored), so to upgrade: read the release notes
+      (upgrade steps, breaking changes), make sure last night's snapshot is in
+      Backblaze, then on the OpenBao host bump `BAO_VERSION` in `config.env`,
+      `git pull`, and `sudo ./bootstrap.sh --role …` with the host's usual roles.
+
+  - name: cloudflared
+    type: github-release
+    repo: cloudflare/cloudflared
+    edits:
+      - file: pins.env
+        pattern: '^CLOUDFLARED_VERSION=(?P<version>\d+\.\d+\.\d+)$'
+        docker_image: cloudflare/cloudflared
+      - file: pins.env
+        pattern: '^CLOUDFLARED_LINUX_AMD64_SHA256=(?P<sha256>[0-9a-f]{64})$'
+        asset: cloudflared-linux-amd64
+    notes: |
+      Deploys to tunnel targets use the new binary as soon as this merges (they
+      read `pins.env` from infra's `main`): after merging, re-run one tunnel
+      backend's deploy to check SSH through the tunnel still works. Servers'
+      tunnel containers move on their next `bootstrap.sh` run.
+
+  - name: probe-image
+    type: docker-tag
+    image: curlimages/curl
+    tag_pattern: '^(?P<version>\d+\.\d+\.\d+)$'
+    edits:
+      - file: pins.env
+        pattern: '^PROBE_IMAGE=curlimages/curl:(?P<version>\d+\.\d+\.\d+)$'
+    notes: |
+      Backend deploys with a `health_path` probe through this image as soon as
+      this merges. After merging, re-run a backend deploy that has a
+      `health_path` and check its health check passes.

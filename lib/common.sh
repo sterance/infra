@@ -47,6 +47,16 @@ load_config() {
   export INFRA_REPO BAO_VERSION STACK_DIR APPS_DIR TUNNEL_NAME SNAPSHOT_KEEP_DAYS SSH_ADMIN_USERS
 }
 
+# Versions infra pins (pins.env at the repo root; the weekly dependency check updates it).
+# Parsed rather than sourced, like deploy-backend.yml does.
+load_pins() {
+  local f="$INFRA_ROOT/pins.env"
+  [[ -f "$f" ]] || die "Missing $f"
+  CLOUDFLARED_VERSION=$(sed -n 's/^CLOUDFLARED_VERSION=\([0-9][0-9.]*\)$/\1/p' "$f" | tail -n 1)
+  [[ -n "$CLOUDFLARED_VERSION" ]] || die "$f has no CLOUDFLARED_VERSION"
+  export CLOUDFLARED_VERSION
+}
+
 # Write stdin to a root-owned file on a remote host. sudo needs a terminal for its
 # password prompt, so the content goes to a private temp file first, then a second
 # ssh -t session runs sudo interactively.  usage: ... | remote_sudo_install <host> <dest> <mode>

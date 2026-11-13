@@ -1,0 +1,109 @@
+# Example .github/updates.yml, with every check type. Each repo's own file
+# describes what it pins; the weekly dependency check (infra's reusable
+# .github/workflows/dependency-updates.yml) reads it. See updates/README.md.
+#
+# Every edit is a file and a regular expression (multi-line mode, Python
+# syntax; single quotes in YAML keep backslashes as they are). Its named
+# groups say what to rewrite:
+#   version   the pinned version. All edits of a check must agree on it.
+#   sha256    (github-release) the asset's SHA-256, checked against a download
+#   size      (github-release) the asset's size in bytes
+#   tag       optional: the image tag docker_image checks (default: the text
+#             after the match's last ':', or else the version)
+# Each pattern must match exactly once (or `count` times), or the check fails.
+# Checks never edit .github/workflows/: point them at a data file instead.
+#
+# Options for every check: name (it names the branch updates/<name>), type,
+# mode (pr, the default, or issue), notes (appended to the PR or issue).
+# An edit's docker_image: the new tag must exist there before a PR is opened.
+version: 1
+
+# Dependabot (.github/dependabot.yml) is generated: ecosystems are detected
+# from lockfiles (Cargo, npm, pip, Go) and workflows (GitHub Actions). Entries
+# here add a directory, set extra options on one, or turn one off.
+dependabot:
+  npm:
+    - directory: /frontend
+      ignore:
+        # Its major follows Node's, which the nodejs check moves.
+        - dependency-name: "@types/node"
+          update-types: [version-update:semver-major]
+    - directory: /docs/site
+      enabled: false
+  docker:
+    # Not detected by default (image versions often move with other files);
+    # fine where an image is all that changes.
+    - directory: /tools
+
+checks:
+  # The current stable Rust.
+  - name: rust
+    type: rust-toolchain
+    edits:
+      - { file: rust-toolchain.toml, pattern: '^channel = "(?P<version>[\d.]+)"$' }
+      - { file: server/Cargo.toml, pattern: '^rust-version = "(?P<version>[\d.]+)"$' }
+      - file: server/Dockerfile
+        pattern: '\brust:(?P<version>[\d.]+)-slim-\w+'
+        docker_image: library/rust
+    notes: New Clippy lints can fail CI on this PR; fix them on its branch.
+
+  # The newest LTS major of Node.js (majors only).
+  - name: nodejs
+    type: node-lts
+    edits:
+      - { file: frontend/.nvmrc, pattern: '\A(?P<version>\d+)$' }
+      - { file: server/Dockerfile, pattern: '\bnode:(?P<version>\d+)-alpine\b', docker_image: library/node }
+
+  # A Chocolatey package.
+  - name: inno-setup
+    type: chocolatey
+    package: innosetup
+    edits:
+      - { file: installer/inno-setup-version, pattern: '\A(?P<version>[\d.]+)$' }
+
+  # Debian's stable release, by codename. Usually an issue: a new base
+  # image is a deliberate change.
+  - name: debian
+    type: debian-stable
+    mode: issue
+    edits:
+      - { file: server/Dockerfile, pattern: '\bdebian:(?P<version>[a-z]+)-slim\b' }
+      - { file: server/Dockerfile, pattern: '\brust:[\d.]+-slim-(?P<version>[a-z]+)\b', docker_image: library/rust }
+
+  # A GitHub repository's releases. tag_pattern's version group is the
+  # version (default: v1.2.3 or 1.2.3); prerelease: true includes prereleases.
+  # An edit with `asset` gets that release file's SHA-256 (and size), from the
+  # release API's digest and checked against a download.
+  - name: cloudflared
+    type: github-release
+    repo: cloudflare/cloudflared
+    tag_pattern: '^(?P<version>\d+\.\d+\.\d+)$'
+    prerelease: false
+    edits:
+      - { file: pins.env, pattern: '^CLOUDFLARED_VERSION=(?P<version>[\d.]+)$', docker_image: cloudflare/cloudflared }
+      - file: pins.env
+        pattern: '^CLOUDFLARED_SHA256=(?P<sha256>[0-9a-f]{64})$'
+        asset: cloudflared-linux-amd64        # {version} and {tag} are filled in
+      - file: pins.env
+        pattern: '^CLOUDFLARED_SIZE=(?P<size>\d+)$'
+        asset: cloudflared-linux-amd64
+
+  # An image's tags (Docker Hub, GHCR, Quay, …), for a pinned image that
+  # moves on its own.
+  - name: curl-image
+    type: docker-tag
+    image: curlimages/curl
+    tag_pattern: '^(?P<version>\d+\.\d+\.\d+)$'
+    edits:
+      - { file: pins.env, pattern: '^PROBE_IMAGE=curlimages/curl:(?P<version>[\d.]+)$' }
+
+  # Anything only this repository understands. `run` runs from the repo root
+  # with no secrets, UPDATE_OUT set to an empty directory, and UPDATE_DRY_RUN=1
+  # in dry runs. It edits files if there's an update, writes
+  # $UPDATE_OUT/result.json ({"result": "none" | "pr" | "issue", "title": …,
+  # "version": …}) and $UPDATE_OUT/body.md, and exits 0. Infra makes the patch
+  # and opens the PR or issue.
+  - name: llama-cpp
+    type: custom
+    run: python3 scripts/updates/llama_cpp.py
+    notes: Run the GPU checklist above before merging.

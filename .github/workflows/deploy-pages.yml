@@ -28,7 +28,7 @@ jobs:
           echo "SUB=${SUB:-$REPO}" >> "$GITHUB_ENV"
 
       - name: OpenBao login + shared secrets
-        uses: hashicorp/vault-action@v3
+        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
         with:
           url: ${{ inputs.bao_addr }}
           method: jwt

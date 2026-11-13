@@ -5,7 +5,7 @@
 #   Later runs:               bin/bao-configure            (as your admin login, after config changes)
 #   Backup token only:        bin/bao-configure --backup-token [--server me@homeserver]
 #
-# Sets up: audit log, KV v2 at kv/, SSH CA + roles, GitHub Actions JWT auth + policies,
+# Sets up: audit log, KV v2 at kv/, SSH CA + roles, GitHub Actions JWT auth + policies (deploy, updates),
 # your userpass login, kv/shared/cloudflare and kv/shared/ghcr (prompts for missing values),
 # and a periodic snapshot token. --server copies that token to the OpenBao host over SSH.
 set -euo pipefail
@@ -107,6 +107,27 @@ bao write auth/jwt/role/deploy - >/dev/null <<EOF
  "token_policies":["ci"],"token_ttl":"10m","token_max_ttl":"15m"}
 EOF
 ok "GitHub Actions: role 'deploy' for $GH_OWNER/* on main, policy 'ci'"
+
+# Dependency updates: the GitHub App's key, readable only by infra's own reusable workflow
+# (dependency-updates.yml on infra's main), running for a repo's main branch. Not under kv/shared/:
+# the key mints tokens for every repo the app is installed on, so repos' own code must never read it.
+# The audience is BAO_ADDR, so a JWT a caller had minted for some other address is useless here.
+bao policy write updates - >/dev/null <<'EOF'
+path "kv/data/updates/github-app" { capabilities = ["read"] }
+EOF
+bao write auth/jwt/role/updates - >/dev/null <<EOF
+{"role_type":"jwt","user_claim":"repository","bound_audiences":["$BAO_ADDR"],
+ "bound_claims_type":"string",
+ "bound_claims":{"repository_owner":"$GH_OWNER","ref":"refs/heads/main",
+   "job_workflow_ref":"$INFRA_REPO/.github/workflows/dependency-updates.yml@refs/heads/main"},
+ "token_policies":["updates"],"token_ttl":"5m","token_max_ttl":"10m"}
+EOF
+ok "GitHub Actions: role 'updates' for $INFRA_REPO's dependency-updates.yml on main, policy 'updates'"
+if bao kv get -mount=kv updates/github-app >/dev/null 2>&1; then
+  ok "kv/updates/github-app exists"
+else
+  warn "no kv/updates/github-app yet: dependency update PRs can't be opened until you create the GitHub App (updates/README.md)"
+fi
 
 jq -e '."userpass/"' >/dev/null <<<"$AUTHS" || bao auth enable userpass >/dev/null
 if bao read "auth/userpass/users/$BAO_ADMIN_USER" >/dev/null 2>&1; then

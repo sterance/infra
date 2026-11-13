@@ -6,3 +6,5 @@ config.env
 *.json.secret
 INIT-OUTPUT*.txt
 /docs
+# Python bytecode (updates/)
+__pycache__/

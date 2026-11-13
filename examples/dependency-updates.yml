@@ -1,0 +1,28 @@
+# Example caller for dependency updates (.github/workflows/dependency-updates.yml).
+# bin/onboard-repo.sh --updates writes this for you (with the schedule from updates/defaults.yml),
+# plus a starter .github/updates.yml (see examples/updates.yml) and the generated .github/dependabot.yml.
+# It needs no secrets: only the BAO_ADDR repo variable that onboarding sets.
+name: Dependency updates
+on:
+  schedule:
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run every check and show the diffs; open nothing"
+        type: boolean
+        default: false
+      fail:
+        description: "Make this check fail on purpose (to test the failure issue)"
+        type: string
+        default: ""
+permissions: { contents: read, issues: write, actions: read, id-token: write }
+jobs:
+  updates:
+    uses: your-github-user/infra/.github/workflows/dependency-updates.yml@main
+    with:
+      bao_addr: ${{ vars.BAO_ADDR }}
+      infra_repo: your-github-user/infra
+      infra_ref: main
+      dry_run: ${{ inputs.dry_run == true }}
+      fail: ${{ inputs.fail || '' }}

@@ -25,6 +25,9 @@ on:
       health_path:    { type: string, default: "" }   # e.g. /api/health, must return 2xx; "" = container-state checks only
       health_timeout: { type: string, default: "90" } # seconds to wait for the new container to become healthy
       health_stable:  { type: string, default: "10" } # seconds it must stay up with no restarts to count as healthy
+      # Where pins.env (cloudflared, the probe image) is read from. Callers normally leave these.
+      infra_repo: { type: string, default: "" }       # default: <owner>/infra
+      infra_ref:  { type: string, default: "main" }
 
 # Two deploys of the same app to the same target never interleave their rollback bookkeeping.
 # (GitHub keeps one pending run per group: a third queued deploy replaces the waiting second one.)
@@ -42,7 +45,7 @@ jobs:
     steps:
       # Log in only: values vault-action reads are masked, and GitHub drops masked job outputs
       - name: OpenBao login
-        uses: hashicorp/vault-action@v3
+        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
         with:
           url: ${{ inputs.bao_addr }}
           method: jwt
@@ -77,11 +80,11 @@ jobs:
       - uses: actions/checkout@v4
       - id: img
         run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ github.token }}" }
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           push: true
           context: ${{ inputs.context }}
@@ -102,7 +105,7 @@ jobs:
       IMAGE: ${{ needs.build.outputs.image }}
     steps:
       - name: OpenBao login + shared secrets
-        uses: hashicorp/vault-action@v3
+        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
         with:
           url: ${{ inputs.bao_addr }}
           method: jwt
@@ -115,6 +118,25 @@ jobs:
             kv/data/shared/cloudflare domain    | DOMAIN ;
             kv/data/shared/ghcr username        | GHCR_USER ;
             kv/data/shared/ghcr token           | GHCR_TOKEN
+
+      # Versions infra pins (updated by its weekly dependency check). Parsed, never executed.
+      - name: Infra pins
+        env:
+          INFRA_REPO: ${{ inputs.infra_repo || format('{0}/infra', github.repository_owner) }}
+          INFRA_REF: ${{ inputs.infra_ref }}
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/$INFRA_REPO/$INFRA_REF/pins.env"
+          curl -fsS --retry 3 --retry-all-errors -o "$RUNNER_TEMP/pins.env" "$url" \
+            || { echo "::error::Couldn't read $url (infra must be public, or pass infra_repo/infra_ref)"; exit 1; }
+          pin() { sed -n "s/^$1=\($2\)\r\{0,1\}\$/\1/p" "$RUNNER_TEMP/pins.env" | tail -n 1; }
+          CF_VERSION=$(pin CLOUDFLARED_VERSION '[0-9][0-9.]*')
+          CF_SHA256=$(pin CLOUDFLARED_LINUX_AMD64_SHA256 '[0-9a-f]\{64\}')
+          PROBE=$(pin PROBE_IMAGE '[a-z0-9][a-z0-9./_-]*:[A-Za-z0-9][A-Za-z0-9._-]*')
+          [ -n "$CF_VERSION" ] && [ -n "$CF_SHA256" ] && [ -n "$PROBE" ] \
+            || { echo "::error::pins.env at $INFRA_REPO@$INFRA_REF lacks CLOUDFLARED_VERSION, CLOUDFLARED_LINUX_AMD64_SHA256 or PROBE_IMAGE"; exit 1; }
+          { echo "CF_VERSION=$CF_VERSION"; echo "CF_SHA256=$CF_SHA256"; echo "PROBE=$PROBE"; } >> "$GITHUB_ENV"
+          echo "cloudflared $CF_VERSION, probe $PROBE"
 
       - name: Prepare bundle
         run: |
@@ -206,9 +228,12 @@ jobs:
             CFA=$(curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" "$BAO_ADDR/v1/kv/data/shared/cloudflare-access")
             CF_ID=$(jq -r .data.data.client_id <<<"$CFA"); CF_SECRET=$(jq -r .data.data.client_secret <<<"$CFA")
             echo "::add-mask::$CF_SECRET"
-            sudo curl -fsSL -o /usr/local/bin/cloudflared \
-              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            sudo chmod +x /usr/local/bin/cloudflared
+            # Pinned in pins.env, and checked against its SHA-256 before it runs
+            curl -fsSL -o "$RUNNER_TEMP/cloudflared" \
+              "https://github.com/cloudflare/cloudflared/releases/download/$CF_VERSION/cloudflared-linux-amd64"
+            echo "$CF_SHA256  $RUNNER_TEMP/cloudflared" | sha256sum -c --quiet \
+              || { echo "::error::cloudflared $CF_VERSION doesn't match the SHA-256 in pins.env"; exit 1; }
+            sudo install -m 755 "$RUNNER_TEMP/cloudflared" /usr/local/bin/cloudflared
             {
               echo "  HostName $TARGET_SSH_HOST"
               echo "  ProxyCommand cloudflared access ssh --hostname %h --service-token-id $CF_ID --service-token-secret $CF_SECRET"
@@ -235,7 +260,7 @@ jobs:
           ssh target "cat > $R/deploy.sh" <<'REMOTE'
           set -uo pipefail
           REPO=$1 D=$2 RUN=$3 SITE=$4 IMAGE=$5 PORT=$6 HEALTH_PATH=$7 HEALTH_TIMEOUT=$8 HEALTH_STABLE=$9
-          PROBE=curlimages/curl:8.11.1   # pinned; app images often lack curl, so probe from a throwaway container
+          PROBE=${10}   # pinned in pins.env; app images often lack curl, so probe from a throwaway container
           CADDY_RELOAD=(docker exec caddy caddy reload --config /etc/caddy/Caddyfile)
           # The exit code is what the job reports; the staged app.env never outlives the run
           trap 'echo $? > "$RUN/rc.tmp"; mv -f "$RUN/rc.tmp" "$RUN/rc"; rm -f "$RUN/app.env"' EXIT
@@ -386,7 +411,7 @@ jobs:
 
           # Start it detached; $! is the script itself (setsid doesn't fork when not a group leader)
           ARGS=$(printf '%q ' "$REPO" "$D" "$R" "$STACK_DIR/caddy/sites/$REPO.caddy" "$IMAGE" "$PORT" \
-                   "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$HEALTH_STABLE")
+                   "$HEALTH_PATH" "$HEALTH_TIMEOUT" "$HEALTH_STABLE" "$PROBE")
           ssh target "cd $R || exit 1; setsid nohup bash deploy.sh $ARGS >log 2>&1 </dev/null & echo \$! > pid"
           echo "Deploy script started on the target; its log is $R/log"
 
