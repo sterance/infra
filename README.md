@@ -237,6 +237,15 @@ Cloudflare Access or WAF rules can block GitHub, so the on-server check decides 
 same repo to the same target queue one after another (a `concurrency` group), so their rollback bookkeeping
 never interleaves; if several are queued, GitHub keeps only the newest waiting one.
 
+The script runs **detached on the target**: each run uploads its files and the script to
+`/opt/apps/<repo>/.deploys/<run id>-<attempt>/`, starts it with `setsid nohup`, and the job only follows its
+`log` (reconnecting if the SSH connection drops). So cancelling the job can't stop a deploy between swapping
+`compose.yml` and the health check or rollback. That matters with `--gate-on-ci` when the repo's CI uses
+`concurrency: … cancel-in-progress: true`, because a newer push cancels the running deploy job. The cancelled
+deploy still finishes on the server, and it holds `/opt/apps/<repo>/.deploy.lock` until it does, so the
+next deploy waits for it there (up to 15 minutes). A cancelled job writes no step summary; its result is the
+`DEPLOY_RESULT=` line in that run's `log`. The logs of the last 10 runs are kept.
+
 To roll back by hand on the server: `cd /opt/apps/<repo> && cp compose.yml.prev compose.yml && cp app.env.prev
 app.env && docker compose up -d`. Usually it's easier to re-run an older successful deploy from Actions.
 
